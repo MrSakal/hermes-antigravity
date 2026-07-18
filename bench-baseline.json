@@ -1,0 +1,139 @@
+{
+  "config": {
+    "port": 8799,
+    "iters": 1,
+    "loop": null,
+    "http": null,
+    "model": null,
+    "label": null
+  },
+  "n_events": 5,
+  "overall": {
+    "spawn_ms": {
+      "n": 2,
+      "p50": 39.0,
+      "p95": 46.2,
+      "min": 31,
+      "max": 47
+    },
+    "ttft_ms": {
+      "n": 2,
+      "p50": 3367.0,
+      "p95": 5174.2,
+      "min": 1359,
+      "max": 5375
+    },
+    "total_ms": {
+      "n": 3,
+      "p50": 5969.0,
+      "p95": 7136.3,
+      "min": 1390,
+      "max": 7266
+    },
+    "tok_per_s": {
+      "n": 3,
+      "p50": 144.8,
+      "p95": 28408.039999999997,
+      "min": 0.0,
+      "max": 31548.4
+    }
+  },
+  "by_label": {
+    "autonomous": {
+      "spawn_ms": {
+        "n": 1,
+        "p50": 47,
+        "p95": 47,
+        "min": 47,
+        "max": 47
+      },
+      "ttft_ms": {
+        "n": 1,
+        "p50": 5375,
+        "p95": 5375,
+        "min": 5375,
+        "max": 5375
+      },
+      "total_ms": {
+        "n": 1,
+        "p50": 5969,
+        "p95": 5969,
+        "min": 5969,
+        "max": 5969
+      },
+      "tok_per_s": {
+        "n": 1,
+        "p50": 144.8,
+        "p95": 144.8,
+        "min": 144.8,
+        "max": 144.8
+      }
+    },
+    "tool": {
+      "spawn_ms": {
+        "n": 1,
+        "p50": 31,
+        "p95": 31,
+        "min": 31,
+        "max": 31
+      },
+      "ttft_ms": {
+        "n": 1,
+        "p50": 1359,
+        "p95": 1359,
+        "min": 1359,
+        "max": 1359
+      },
+      "total_ms": {
+        "n": 2,
+        "p50": 4328.0,
+        "p95": 6972.2,
+        "min": 1390,
+        "max": 7266
+      },
+      "tok_per_s": {
+        "n": 2,
+        "p50": 15774.2,
+        "p95": 29970.98,
+        "min": 0.0,
+        "max": 31548.4
+      }
+    }
+  },
+  "raw_events": [
+    {
+      "event": "spawn",
+      "label": "autonomous",
+      "spawn_ms": 47
+    },
+    {
+      "event": "turn",
+      "label": "autonomous",
+      "ttft_ms": 5375,
+      "total_ms": 5969,
+      "completion_tokens": 86,
+      "tok_per_s": 144.8
+    },
+    {
+      "event": "spawn",
+      "label": "tool",
+      "spawn_ms": 31
+    },
+    {
+      "event": "turn",
+      "label": "tool",
+      "ttft_ms": null,
+      "total_ms": 7266,
+      "completion_tokens": 0,
+      "tok_per_s": 0.0
+    },
+    {
+      "event": "turn",
+      "label": "tool",
+      "ttft_ms": 1359,
+      "total_ms": 1390,
+      "completion_tokens": 978,
+      "tok_per_s": 31548.4
+    }
+  ]
+}
