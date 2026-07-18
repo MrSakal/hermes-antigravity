@@ -51,6 +51,14 @@ def result(status="SUCCESS", response="", error=None, usage=None):
 
 
 def main():
+    if MODE == "hang":
+        # For suspend/resume tests: emit init + one text delta, then stay alive
+        # (as a real agy does while blocked inside our MCP call_tool).
+        init_line()
+        text(2, "Working ", state="ACTIVE")
+        time.sleep(float(os.environ.get("FAKE_AGY_HANG_S", "60")))
+        return
+
     if MODE == "echoargs":
         emit({"argv": sys.argv[1:]})
         result(response="argv echoed")

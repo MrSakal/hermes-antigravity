@@ -28,10 +28,10 @@ from dataclasses import dataclass, field
 from typing import Any, Optional, Union
 
 # The generic builtin through which agy reaches every MCP tool. Calls whose
-# ``ServerName`` equals our bridge's server name are hermes function calls;
-# every other tool step is an Antigravity builtin running internally.
+# ``ServerName`` equals a conversation's allocated server slot ("hermes",
+# "hermes2", …) are hermes function calls; every other tool step is an
+# Antigravity builtin running internally.
 MCP_TOOL_NAME = "call_mcp_tool"
-HERMES_SERVER_NAME = "hermes"
 
 
 # ── Event types ─────────────────────────────────────────────────────────────
@@ -69,9 +69,9 @@ class ToolStep:
         v = self.parameters.get("ServerName")
         return v if isinstance(v, str) else None
 
-    @property
-    def is_hermes(self) -> bool:
-        return self.is_mcp and self.mcp_server == HERMES_SERVER_NAME
+    def matches_server(self, slot: str) -> bool:
+        """True when this is a ``call_mcp_tool`` aimed at our server ``slot``."""
+        return self.is_mcp and self.mcp_server == slot
 
     @property
     def hermes_function_name(self) -> str:

@@ -72,6 +72,7 @@ class AgySession:
         self._reader_task: Optional[asyncio.Task[None]] = None
         self._stderr_task: Optional[asyncio.Task[None]] = None
         self._closed = False
+        self._pushback: list[Union[ChatEvent, object]] = []
         # Diagnostics: last raw stdout lines the parser skipped + stderr tail.
         self.raw_tail: deque[str] = deque(maxlen=5)
         self.stderr_tail: deque[str] = deque(maxlen=5)
@@ -170,11 +171,17 @@ class AgySession:
 
     # ── reading ───────────────────────────────────────────────────────────—
 
+    def push_back(self, ev: Union[ChatEvent, object]) -> None:
+        """Return an already-popped event to the front of the stream."""
+        self._pushback.append(ev)
+
     async def next_event(
         self, timeout: Optional[float] = None
     ) -> Union[ChatEvent, object, None]:
         """Pop the next event. Returns :data:`STREAM_CLOSED` at EOF, or ``None``
         if ``timeout`` elapses first."""
+        if self._pushback:
+            return self._pushback.pop(0)
         try:
             if timeout is None:
                 return await self._queue.get()

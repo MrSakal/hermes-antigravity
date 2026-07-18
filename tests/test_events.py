@@ -94,13 +94,13 @@ def test_text_deltas():
 def test_tool_steps_and_mcp_helpers():
     ev = parse_line(TOOL_ACTIVE)
     assert isinstance(ev, ToolStep)
-    assert ev.state == "ACTIVE" and ev.is_mcp and ev.is_hermes
+    assert ev.state == "ACTIVE" and ev.is_mcp and ev.matches_server("hermes")
     assert ev.hermes_function_name == "get_weather"
     assert ev.hermes_arguments == {"text": "hi"}
 
     ev = parse_line(TOOL_DONE)
     assert isinstance(ev, ToolStep)
-    assert ev.state == "DONE" and ev.is_mcp and not ev.is_hermes
+    assert ev.state == "DONE" and ev.is_mcp and not ev.matches_server("hermes")
     assert ev.output == "{\"ok\": true}"
 
 

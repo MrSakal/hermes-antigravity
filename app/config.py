@@ -112,8 +112,19 @@ class Settings(BaseSettings):
     # Empty => only `default_workdir` is allowed.
     allowed_workdir_roots: list[str] = []
 
+    # ── MCP config registration ─────────────────────────────────────────────
+    # Tool-turn conversations register per-conversation server entries
+    # ("hermes", "hermes2", …) in the shared Antigravity MCP config — the ONLY
+    # file agy honors. Override the path for tests; disable management entirely
+    # to run the autonomous path without ever touching the user's config.
+    mcp_config_path: Optional[Path] = None
+    manage_mcp_config: bool = True
+
     # ── Lifecycle / timeouts (seconds) ─────────────────────────────────────—
     request_timeout_s: int = 600
+    suspended_ttl_s: int = 300
+    idle_session_ttl_s: int = 900
+    gc_interval_s: int = 30
 
     # ── Logging ────────────────────────────────────────────────────────────—
     log_level: str = "INFO"

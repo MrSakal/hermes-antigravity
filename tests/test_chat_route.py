@@ -14,6 +14,8 @@ from app.config import get_settings
 @pytest.fixture
 def client(fake_agy, monkeypatch, tmp_path):
     monkeypatch.setenv("AGI_DEFAULT_WORKDIR", str(tmp_path / "ws"))
+    # Never touch the user's real shared Antigravity MCP config from tests.
+    monkeypatch.setenv("AGI_MCP_CONFIG_PATH", str(tmp_path / "mcp_config.json"))
     get_settings.cache_clear()
     application = main_mod.create_app()
     transport = httpx.ASGITransport(app=application)
@@ -110,14 +112,23 @@ async def test_conv_cache_roundtrip(client, fake_agy):
     assert len(application.state.conv_cache) == 2
 
 
-async def test_tools_rejected_phase1(client):
-    http, _ = client
+async def test_tools_request_without_tool_use_completes(client, fake_agy, tmp_path):
+    """A tools-bearing request whose model never calls a tool ends as a normal
+    completion — and the per-conversation MCP config entry is added/removed."""
+    fake_agy("simple")
+    http, application = client
     r = await http.post("/v1/chat/completions", json={
         "messages": [{"role": "user", "content": "hi"}],
-        "tools": [{"type": "function", "function": {"name": "f"}}],
+        "tools": [{"type": "function", "function": {"name": "get_weather"}}],
     })
-    assert r.status_code == 400
-    assert "Phase 2" in r.json()["error"]["message"]
+    assert r.status_code == 200
+    body = r.json()
+    assert body["choices"][0]["finish_reason"] == "stop"
+    assert body["choices"][0]["message"]["content"]
+    # Conversation closed → our slot entry removed again.
+    cfg_path = tmp_path / "mcp_config.json"
+    if cfg_path.exists():
+        assert "hermes" not in json.loads(cfg_path.read_text())["mcpServers"]
 
 
 async def test_empty_messages_rejected(client):

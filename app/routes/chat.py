@@ -20,6 +20,15 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from app.agy_session import STREAM_CLOSED, AgySession
 from app.config import ensure_workdir, get_settings, resolve_model
 from app.convcache import ConversationCache
+from app.conversation import (
+    ConversationManager,
+    DoneChunk,
+    ErrorChunk,
+    ExpiredContinuation,
+    TextChunk,
+    ToolBoundaryChunk,
+    ToolCallsChunk,
+)
 from app.errors import OpenAIError, error_envelope
 from app.events import Error, TextDelta, ToolStep, TurnDone
 from app.openai_models import ChatCompletionRequest
@@ -36,6 +45,7 @@ from app.translate import (
     split_system,
     sse,
     text_chunk,
+    tool_calls_chunk,
     usage_from_turn,
 )
 
@@ -60,13 +70,15 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
         raise OpenAIError(str(e), status_code=400, param="workdir")
     ensure_workdir(workdir)
 
-    if req.tools:
-        raise OpenAIError(
-            "tool calling is not supported yet (Phase 2)",
-            status_code=400,
-            type="invalid_request_error",
-            param="tools",
-        )
+    # ── tool-passthrough path (suspend/resume via the MCP bridge) ──────────
+    if req.tools or ConversationManager.is_continuation(req):
+        if request.app.state.conv_manager is None:
+            raise OpenAIError(
+                "tool calling requires MCP config management "
+                "(AGI_MANAGE_MCP_CONFIG=true)",
+                status_code=400, type="invalid_request_error", param="tools",
+            )
+        return await _handle_tools(req, request, model, workdir)
 
     cache: ConversationCache = request.app.state.conv_cache
 
@@ -257,3 +269,116 @@ def _store(cache: ConversationCache, req: ChatCompletionRequest,
     text = "".join(text_parts) or (turn.response_text or "")
     if conv_id and text.strip():
         cache.store(req.messages, text, conv_id)
+
+
+# ── tool-passthrough path ───────────────────────────────────────────────────
+
+
+async def _handle_tools(
+    req: ChatCompletionRequest, request: Request, model: str, workdir
+):
+    mgr: ConversationManager = request.app.state.conv_manager
+
+    if mgr.is_continuation(req):
+        try:
+            conv = await mgr.resume(req)
+        except ExpiredContinuation as e:
+            raise OpenAIError(
+                str(e), status_code=409, type="invalid_request_error",
+                code="tool_result_expired",
+            )
+    else:
+        conv = await mgr.create(req, model=model, workdir=workdir)
+
+    cid = new_completion_id()
+    created = now()
+    settings = get_settings()
+    flatten = settings.flatten_markdown_tables
+    timing = settings.timing_log
+
+    if req.stream:
+        return StreamingResponse(
+            _tool_stream(mgr, conv, cid, model, created, flatten, timing),
+            media_type="text/event-stream",
+            headers=_SSE_HEADERS,
+        )
+    body = await _tool_collect(mgr, conv, cid, model, created, flatten, timing)
+    return JSONResponse(content=body)
+
+
+async def _tool_stream(mgr, conv, cid, model, created, flatten_tables: bool = True,
+                       timing: bool = False):
+    filt = OutputFilter(flatten_tables=flatten_tables)
+    timer = TurnTimer(timing, "tool")
+    completion_tokens = 0
+    try:
+        yield sse(role_chunk(cid, model, created))
+        async for ch in mgr.run_turn(conv):
+            if isinstance(ch, TextChunk):
+                out = filt.feed(ch.text)
+                if out:
+                    timer.first_token()
+                    yield sse(text_chunk(cid, model, created, out))
+            elif isinstance(ch, ToolBoundaryChunk):
+                filt.tool_boundary()
+            elif isinstance(ch, ToolCallsChunk):
+                tail = filt.flush()
+                if tail:
+                    yield sse(text_chunk(cid, model, created, tail))
+                calls = [
+                    {**pc.openai_tool_call(), "index": i} for i, pc in enumerate(ch.calls)
+                ]
+                yield sse(tool_calls_chunk(cid, model, created, calls))
+                yield sse(finish_chunk(cid, model, created, "tool_calls"))
+                break
+            elif isinstance(ch, DoneChunk):
+                tail = filt.flush()
+                if tail:
+                    yield sse(text_chunk(cid, model, created, tail))
+                completion_tokens = (ch.usage or {}).get("completion_tokens", 0)
+                yield sse(finish_chunk(cid, model, created, ch.finish_reason, ch.usage or None))
+                break
+            elif isinstance(ch, ErrorChunk):
+                yield sse(error_envelope(ch.message, type="upstream_error"))
+                break
+        yield DONE
+    finally:
+        timer.done(completion_tokens)
+
+
+async def _tool_collect(mgr, conv, cid, model, created, flatten_tables: bool = True,
+                        timing: bool = False) -> dict:
+    filt = OutputFilter(flatten_tables=flatten_tables)
+    timer = TurnTimer(timing, "tool")
+    completion_tokens = 0
+    text_parts: list[str] = []
+    try:
+        async for ch in mgr.run_turn(conv):
+            if isinstance(ch, TextChunk):
+                if ch.text:
+                    timer.first_token()
+                text_parts.append(filt.feed(ch.text))
+            elif isinstance(ch, ToolBoundaryChunk):
+                filt.tool_boundary()
+            elif isinstance(ch, ToolCallsChunk):
+                text_parts.append(filt.flush())
+                return completion_response(
+                    cid, model, created,
+                    content="".join(text_parts) or None,
+                    finish_reason="tool_calls",
+                    tool_calls=[pc.openai_tool_call() for pc in ch.calls],
+                )
+            elif isinstance(ch, DoneChunk):
+                text_parts.append(filt.flush())
+                completion_tokens = (ch.usage or {}).get("completion_tokens", 0)
+                return completion_response(
+                    cid, model, created,
+                    content="".join(text_parts),
+                    finish_reason=ch.finish_reason,
+                    usage=ch.usage or None,
+                )
+            elif isinstance(ch, ErrorChunk):
+                raise OpenAIError(ch.message, status_code=ch.status_code, type="upstream_error")
+        raise OpenAIError("no response produced", status_code=502, type="upstream_error")
+    finally:
+        timer.done(completion_tokens)
