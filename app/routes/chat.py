@@ -141,12 +141,10 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
     created = now()
     timeout = settings.request_timeout_s
 
-    # Thinking passthrough: bound to the agy conversation upfront on a resume,
-    # or from the init event on a fresh one (see app/thinking.py).
-    thinking = None
-    if settings.reasoning_content:
-        brain = settings.agy_brain_path or default_brain_path()
-        thinking = TurnThinking(brain, conversation_id)
+    # Thinking passthrough (always on): bound to the agy conversation upfront
+    # on a resume, or from the init event on a fresh one (see app/thinking.py).
+    brain = settings.agy_brain_path or default_brain_path()
+    thinking = TurnThinking(brain, conversation_id)
 
     flatten = settings.flatten_markdown_tables
     if req.stream:

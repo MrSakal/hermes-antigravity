@@ -103,14 +103,13 @@ class Settings(BaseSettings):
     agent_cache_max: int = 64
 
     # ── Reasoning / thinking passthrough ─────────────────────────────────────
-    # Surface the model's thinking as OpenAI-style `reasoning_content` (a
-    # delta chunk before the answer text; `message.reasoning_content` on
-    # non-streaming responses). agy's stream-json hides the thinking text, but
-    # the CLI writes it to its internal brain transcript (undocumented,
-    # verified 1.1.4) — read best-effort from there; degrades to "no
-    # reasoning" if the file/format changes.
-    reasoning_content: bool = True
-    # Antigravity brain directory override (tests). Default:
+    # The model's thinking always surfaces as OpenAI-style `reasoning_content`
+    # (base functionality, no toggle): a delta chunk before the answer text /
+    # `message.reasoning_content` on non-streaming responses. agy's stream-json
+    # hides the thinking text, but the CLI writes it to its internal brain
+    # transcript (undocumented, verified 1.1.4) — read best-effort from there;
+    # degrades to "no reasoning" if the file/format changes.
+    # Brain directory override (tests / nonstandard installs). Default:
     # ~/.gemini/antigravity-cli/brain
     agy_brain_path: Optional[Path] = None
 

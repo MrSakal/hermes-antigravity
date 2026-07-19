@@ -220,12 +220,10 @@ class ConversationManager:
             self.mcp.unregister(conv_id)
             await self.mcp_config.remove_conversation(slot)
             raise
-        thinking = None
-        if self.settings.reasoning_content:
-            brain = self.settings.agy_brain_path or default_brain_path()
-            thinking = TurnThinking(brain)  # bound on the init event
+        brain = self.settings.agy_brain_path or default_brain_path()
         conv = Conversation(conv_id=conv_id, slot=slot, session=session,
-                            bridge=bridge, model=model, thinking=thinking)
+                            bridge=bridge, model=model,
+                            thinking=TurnThinking(brain))  # bound on the init event
         async with self._lock:
             self._conversations[conv_id] = conv
         logger.info("conv=%s created (slot=%s, model=%s, %d tools)",
