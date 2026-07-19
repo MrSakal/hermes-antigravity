@@ -297,6 +297,12 @@ def text_chunk(cid: str, model: str, created: int, text: str) -> dict[str, Any]:
     return _chunk(cid, model, created, delta={"content": text})
 
 
+def reasoning_chunk(cid: str, model: str, created: int, text: str) -> dict[str, Any]:
+    """A ``delta.reasoning_content`` chunk (DeepSeek-style extension hermes
+    renders as the thinking pane)."""
+    return _chunk(cid, model, created, delta={"reasoning_content": text})
+
+
 def tool_calls_chunk(
     cid: str, model: str, created: int, tool_calls: list[dict[str, Any]]
 ) -> dict[str, Any]:
@@ -325,10 +331,13 @@ def completion_response(
     finish_reason: str,
     usage: Optional[dict[str, Any]] = None,
     tool_calls: Optional[list[dict[str, Any]]] = None,
+    reasoning: Optional[str] = None,
 ) -> dict[str, Any]:
     message: dict[str, Any] = {"role": "assistant", "content": content}
     if tool_calls:
         message["tool_calls"] = tool_calls
+    if reasoning:
+        message["reasoning_content"] = reasoning
     obj: dict[str, Any] = {
         "id": cid,
         "object": "chat.completion",

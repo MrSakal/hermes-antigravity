@@ -37,10 +37,11 @@ from typing import Optional, Union
 from app.agent_config import AgentPluginManager
 from app.agy_session import STREAM_CLOSED, AgySession
 from app.config import Settings
-from app.events import Error, TextDelta, ToolStep, TurnDone
+from app.events import Error, Init, TextDelta, ToolStep, TurnDone
 from app.mcp_bridge import ConversationBridge, McpBridge, PendingCall
 from app.mcp_config import McpConfigManager
 from app.openai_models import ChatCompletionRequest, ChatMessage
+from app.thinking import TurnThinking, default_brain_path
 from app.translate import (
     build_prompt,
     materialize_messages,
@@ -87,7 +88,17 @@ class ToolBoundaryChunk:
     segments. Carries no text; the route uses it to insert a blank-line seam."""
 
 
-TurnChunk = Union[TextChunk, ToolCallsChunk, DoneChunk, ErrorChunk, ToolBoundaryChunk]
+@dataclass
+class ReasoningChunk:
+    """One whole thinking block (see app/thinking.py), rendered by the route
+    as a ``delta.reasoning_content`` chunk / ``message.reasoning_content``."""
+
+    text: str
+
+
+TurnChunk = Union[
+    TextChunk, ToolCallsChunk, DoneChunk, ErrorChunk, ToolBoundaryChunk, ReasoningChunk
+]
 
 
 # ── conversation ────────────────────────────────────────────────────────────
@@ -101,6 +112,7 @@ class Conversation:
     bridge: ConversationBridge
     model: str
     state: str = RUNNING
+    thinking: Optional[TurnThinking] = None
     last_activity: float = field(default_factory=time.monotonic)
 
     def touch(self) -> None:
@@ -208,8 +220,12 @@ class ConversationManager:
             self.mcp.unregister(conv_id)
             await self.mcp_config.remove_conversation(slot)
             raise
+        thinking = None
+        if self.settings.reasoning_content:
+            brain = self.settings.agy_brain_path or default_brain_path()
+            thinking = TurnThinking(brain)  # bound on the init event
         conv = Conversation(conv_id=conv_id, slot=slot, session=session,
-                            bridge=bridge, model=model)
+                            bridge=bridge, model=model, thinking=thinking)
         async with self._lock:
             self._conversations[conv_id] = conv
         logger.info("conv=%s created (slot=%s, model=%s, %d tools)",
@@ -273,6 +289,11 @@ class ConversationManager:
         try:
             while True:
                 ev = await self._next_event_or_call(conv, timeout)
+                if conv.thinking is not None:
+                    if isinstance(ev, Init):
+                        conv.thinking.on_init(ev.conversation_id)
+                    for block in conv.thinking.poll():
+                        yield ReasoningChunk(block)
                 if ev is None:
                     await self._close(conv)
                     yield ErrorChunk("upstream timeout", status_code=504)

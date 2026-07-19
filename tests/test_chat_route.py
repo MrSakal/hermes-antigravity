@@ -18,6 +18,7 @@ def client(fake_agy, monkeypatch, tmp_path):
     # from tests.
     monkeypatch.setenv("AGI_MCP_CONFIG_PATH", str(tmp_path / "mcp_config.json"))
     monkeypatch.setenv("AGI_AGENT_PLUGIN_PATH", str(tmp_path / "agent-plugin"))
+    monkeypatch.setenv("AGI_AGY_BRAIN_PATH", str(tmp_path / "brain"))
     get_settings.cache_clear()
     application = main_mod.create_app()
     transport = httpx.ASGITransport(app=application)
@@ -179,6 +180,59 @@ async def test_image_attachment_written_to_workdir(client, fake_agy, tmp_path):
     assert r.status_code == 200
     files = list((tmp_path / "ws" / "attachments").glob("img-*.png"))
     assert len(files) == 1
+
+
+def _write_thinking_transcript(tmp_path, conv="conv-fake-1", thinking="pondering deeply"):
+    tf = (tmp_path / "brain" / conv / ".system_generated" / "logs"
+          / "transcript_full.jsonl")
+    tf.parent.mkdir(parents=True, exist_ok=True)
+    tf.write_text(
+        json.dumps({"type": "PLANNER_RESPONSE", "content": "x", "thinking": thinking}) + "\n",
+        encoding="utf-8",
+    )
+
+
+async def test_reasoning_content_nonstream(client, fake_agy, tmp_path):
+    """Thinking from the brain transcript surfaces as message.reasoning_content."""
+    _write_thinking_transcript(tmp_path)
+    fake_agy("simple")
+    http, _ = client
+    r = await http.post("/v1/chat/completions", json={
+        "messages": [{"role": "user", "content": "hi"}],
+    })
+    assert r.status_code == 200
+    msg = r.json()["choices"][0]["message"]
+    assert msg["content"] == "Hello world"
+    assert msg["reasoning_content"] == "pondering deeply"
+
+
+async def test_reasoning_content_stream(client, fake_agy, tmp_path):
+    _write_thinking_transcript(tmp_path)
+    fake_agy("simple")
+    http, _ = client
+    r = await http.post("/v1/chat/completions", json={
+        "stream": True,
+        "messages": [{"role": "user", "content": "hi"}],
+    })
+    assert r.status_code == 200
+    payloads = [json.loads(c[6:]) for c in r.text.split("\n\n")
+                if c.startswith("data: ") and c != "data: [DONE]"]
+    reasoning = "".join(
+        p["choices"][0]["delta"].get("reasoning_content") or "" for p in payloads
+    )
+    content = "".join(p["choices"][0]["delta"].get("content") or "" for p in payloads)
+    assert reasoning == "pondering deeply"
+    assert content == "Hello world"
+
+
+async def test_no_transcript_means_no_reasoning(client, fake_agy):
+    fake_agy("simple")
+    http, _ = client
+    r = await http.post("/v1/chat/completions", json={
+        "messages": [{"role": "user", "content": "hi"}],
+    })
+    assert r.status_code == 200
+    assert "reasoning_content" not in r.json()["choices"][0]["message"]
 
 
 async def test_empty_messages_rejected(client):

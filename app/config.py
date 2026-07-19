@@ -102,6 +102,18 @@ class Settings(BaseSettings):
     # Max generated agent files kept (LRU by mtime); older ones are pruned.
     agent_cache_max: int = 64
 
+    # ── Reasoning / thinking passthrough ─────────────────────────────────────
+    # Surface the model's thinking as OpenAI-style `reasoning_content` (a
+    # delta chunk before the answer text; `message.reasoning_content` on
+    # non-streaming responses). agy's stream-json hides the thinking text, but
+    # the CLI writes it to its internal brain transcript (undocumented,
+    # verified 1.1.4) — read best-effort from there; degrades to "no
+    # reasoning" if the file/format changes.
+    reasoning_content: bool = True
+    # Antigravity brain directory override (tests). Default:
+    # ~/.gemini/antigravity-cli/brain
+    agy_brain_path: Optional[Path] = None
+
     # ── Image input ──────────────────────────────────────────────────────────
     # agy has no image flag and no stdin channel, but its builtin file tools can
     # view local images (verified live). When enabled, data-URL images in OpenAI

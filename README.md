@@ -39,6 +39,14 @@ follow-up turns resume it via `--conversation <id>`.
   possible, see the deviations note below.) Fallback (when disabled or the
   plugin dir is unwritable): the system message is injected as an instruction
   preamble at the top of the first turn.
+- **Reasoning passthrough** (default on): the model's thinking surfaces as
+  OpenAI-style `reasoning_content` — a delta chunk right before the answer
+  text (streaming) or `message.reasoning_content` (non-streaming), so hermes'
+  thinking pane works. agy's stream-json hides the thinking text; it is read
+  best-effort from the CLI's internal brain transcript (undocumented, verified
+  against 1.1.4). Blocks arrive whole per model step — there is no incremental
+  thinking stream. If the file/format ever changes, responses simply carry no
+  reasoning; nothing breaks.
 - **Image input**: agy has no image flag and no stdin channel, but its builtin
   file tools can view local images. Data-URL images in OpenAI `image_url`
   content parts are written to `<workdir>/attachments/` (content-addressed,
@@ -118,6 +126,13 @@ AGI_SYSTEM_PROMPT_VIA_AGENT=true
 # AGI_AGENT_PLUGIN_PATH=~/.gemini/config/plugins/hermes-bridge
 AGI_AGENT_CACHE_MAX=64
 
+# ── Reasoning / thinking passthrough ─────────────────────────────────────────
+# Surface the model's thinking as `reasoning_content` (delta chunk before the
+# answer / message field on non-streaming). Read best-effort from agy's
+# internal brain transcript; degrades to "no reasoning" on any mismatch.
+AGI_REASONING_CONTENT=true
+# AGI_AGY_BRAIN_PATH=~/.gemini/antigravity-cli/brain
+
 # ── Image input ──────────────────────────────────────────────────────────────
 # Write data-URL images from OpenAI image_url content parts to
 # <workdir>/attachments/ and reference the file in the prompt; agy's builtin
@@ -177,6 +192,8 @@ AGI_TIMING_LOG=false
 | `AGI_SYSTEM_PROMPT_VIA_AGENT` | `true` | Deliver the system message as a generated agent definition (`--agent <slug>`), overriding the CLI persona. Off/unwritable → automatic prompt-preamble fallback. |
 | `AGI_AGENT_PLUGIN_PATH` | `~/.gemini/config/plugins/hermes-bridge` | Managed agent-plugin directory override. |
 | `AGI_AGENT_CACHE_MAX` | `64` | Max generated agent files kept (LRU by mtime). |
+| `AGI_REASONING_CONTENT` | `true` | Surface the model's thinking as `reasoning_content` (read from agy's internal brain transcript, best-effort). |
+| `AGI_AGY_BRAIN_PATH` | `~/.gemini/antigravity-cli/brain` | Brain (conversation transcript) directory override. |
 | `AGI_IMAGE_INPUT` | `true` | Materialize data-URL images as files under `<workdir>/attachments/` and reference them in the prompt. |
 | `AGI_CONVERSATION_CACHE_MAX` | `256` | Max entries in the history→conversation-id cache. |
 | `AGI_CONVERSATION_CACHE_TTL_S` | `3600` | Cache entry lifetime. |
