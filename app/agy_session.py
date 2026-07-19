@@ -54,6 +54,7 @@ class AgySession:
         workdir: Union[str, Path],
         prompt: str,
         conversation_id: Optional[str] = None,
+        agent: Optional[str] = None,
         print_timeout_s: int = 600,
         timing_log: bool = False,
         timing_label: str = "session",
@@ -63,6 +64,7 @@ class AgySession:
         self.workdir = str(workdir)
         self.prompt = prompt
         self.conversation_id = conversation_id
+        self.agent = agent
         self.print_timeout_s = print_timeout_s
         self.timing_log = timing_log
         self.timing_label = timing_label
@@ -92,6 +94,8 @@ class AgySession:
             args += ["--model", self.model]
         if self.conversation_id:
             args += ["--conversation", self.conversation_id]
+        if self.agent:
+            args += ["--agent", self.agent]
         return args
 
     # ── lifecycle ─────────────────────────────────────────────────────────—

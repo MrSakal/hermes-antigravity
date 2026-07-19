@@ -105,6 +105,20 @@ async def test_arg_construction(fake_agy, tmp_path):
     assert "--model" in argv and "Gemini 3.5 Flash (Medium)" in argv
     assert "--conversation" in argv and "prev-42" in argv
     assert "--add-dir" in argv
+    assert "--agent" not in argv
+
+
+async def test_arg_construction_with_agent(fake_agy, tmp_path):
+    fake_agy("echoargs")
+    sess = make_session(tmp_path, agent="hermes-abc123def456")
+    await sess.start()
+    await drain(sess)
+    await sess.aclose()
+
+    argv_line = next((l for l in sess.raw_tail if l.startswith('{"argv"')), None)
+    assert argv_line is not None
+    argv = json.loads(argv_line)["argv"]
+    assert "--agent" in argv and "hermes-abc123def456" in argv
 
 
 async def test_missing_binary_raises(tmp_path):

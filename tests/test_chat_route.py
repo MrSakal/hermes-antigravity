@@ -14,8 +14,10 @@ from app.config import get_settings
 @pytest.fixture
 def client(fake_agy, monkeypatch, tmp_path):
     monkeypatch.setenv("AGI_DEFAULT_WORKDIR", str(tmp_path / "ws"))
-    # Never touch the user's real shared Antigravity MCP config from tests.
+    # Never touch the user's real shared Antigravity MCP config / plugin dir
+    # from tests.
     monkeypatch.setenv("AGI_MCP_CONFIG_PATH", str(tmp_path / "mcp_config.json"))
+    monkeypatch.setenv("AGI_AGENT_PLUGIN_PATH", str(tmp_path / "agent-plugin"))
     get_settings.cache_clear()
     application = main_mod.create_app()
     transport = httpx.ASGITransport(app=application)
@@ -129,6 +131,54 @@ async def test_tools_request_without_tool_use_completes(client, fake_agy, tmp_pa
     cfg_path = tmp_path / "mcp_config.json"
     if cfg_path.exists():
         assert "hermes" not in json.loads(cfg_path.read_text())["mcpServers"]
+
+
+async def test_system_message_materializes_agent(client, fake_agy, tmp_path):
+    """A system message becomes a generated agent definition in the managed
+    plugin (delivered to agy via --agent) instead of a prompt preamble."""
+    fake_agy("simple")
+    http, _ = client
+    r = await http.post("/v1/chat/completions", json={
+        "messages": [
+            {"role": "system", "content": "You are a pirate."},
+            {"role": "user", "content": "hi"},
+        ],
+    })
+    assert r.status_code == 200
+    agents = list((tmp_path / "agent-plugin" / "agents").glob("hermes-*.md"))
+    assert len(agents) == 1
+    assert "You are a pirate." in agents[0].read_text()
+
+
+async def test_agent_mode_disabled_writes_nothing(client, fake_agy, tmp_path, monkeypatch):
+    monkeypatch.setattr(get_settings(), "system_prompt_via_agent", False)
+    fake_agy("simple")
+    http, _ = client
+    r = await http.post("/v1/chat/completions", json={
+        "messages": [
+            {"role": "system", "content": "You are a pirate."},
+            {"role": "user", "content": "hi"},
+        ],
+    })
+    assert r.status_code == 200
+    assert not (tmp_path / "agent-plugin").exists()
+
+
+async def test_image_attachment_written_to_workdir(client, fake_agy, tmp_path):
+    fake_agy("simple")
+    http, _ = client
+    png = ("data:image/png;base64,"
+           "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ"
+           "/pLvAAAAAElFTkSuQmCC")
+    r = await http.post("/v1/chat/completions", json={
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "what color is this?"},
+            {"type": "image_url", "image_url": {"url": png}},
+        ]}],
+    })
+    assert r.status_code == 200
+    files = list((tmp_path / "ws" / "attachments").glob("img-*.png"))
+    assert len(files) == 1
 
 
 async def test_empty_messages_rejected(client):

@@ -19,6 +19,7 @@ from collections.abc import AsyncIterator
 
 from fastapi import FastAPI, Request
 
+from app.agent_config import AgentPluginManager
 from app.config import get_settings
 from app.convcache import ConversationCache
 from app.conversation import ConversationManager
@@ -83,9 +84,15 @@ def create_app() -> FastAPI:
         max_entries=settings.conversation_cache_max,
         ttl_s=settings.conversation_cache_ttl_s,
     )
+    agent_plugin = AgentPluginManager(
+        settings.agent_plugin_path, max_agents=settings.agent_cache_max
+    )
+    app.state.agent_plugin = agent_plugin
     if settings.manage_mcp_config:
         mcp_config = McpConfigManager(settings.mcp_config_path)
-        app.state.conv_manager = ConversationManager(mcp, mcp_config, settings)
+        app.state.conv_manager = ConversationManager(
+            mcp, mcp_config, settings, agents=agent_plugin
+        )
     else:
         app.state.conv_manager = None
 

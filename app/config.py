@@ -87,11 +87,27 @@ class Settings(BaseSettings):
     # 1.1.4 — verified live: `echo .. | agy -p` yields "no output produced").
     # Windows caps a command line at ~32,767 chars; stay safely below it.
     max_prompt_chars: int = 28000
-    # Inject the request's system message as an instruction preamble at the top
-    # of the folded first turn (agy has no --system-prompt / --append-system-prompt
-    # flag). Documented deviation: Antigravity's own identity + builtin tools
-    # remain active underneath.
-    system_prompt_injection: bool = True
+    # ── System prompt via managed agent ─────────────────────────────────────
+    # Deliver the request's system message as a REAL system prompt: materialize
+    # it as an agent definition (agents/hermes-<hash>.md) inside a server-managed
+    # plugin and spawn agy with --agent <slug>. Verified against agy 1.1.4: the
+    # agent body overrides the CLI's built-in persona, agent files are discovered
+    # at conversation start with no install step, and the agent stays in effect
+    # across --conversation resumes. When disabled — or when the plugin dir
+    # cannot be written — the system message automatically falls back to an
+    # instruction preamble at the top of the folded first turn.
+    system_prompt_via_agent: bool = True
+    # Managed plugin directory (never touches other plugins). Override for tests.
+    agent_plugin_path: Optional[Path] = None
+    # Max generated agent files kept (LRU by mtime); older ones are pruned.
+    agent_cache_max: int = 64
+
+    # ── Image input ──────────────────────────────────────────────────────────
+    # agy has no image flag and no stdin channel, but its builtin file tools can
+    # view local images (verified live). When enabled, data-URL images in OpenAI
+    # `image_url` content parts are written to <workdir>/attachments/ and the
+    # prompt references the file so the model looks at it.
+    image_input: bool = True
 
     # ── Conversation continuity ─────────────────────────────────────────────—
     # agy stores conversation history server-side; `--conversation <id>` resumes

@@ -34,13 +34,20 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, Union
 
+from app.agent_config import AgentPluginManager
 from app.agy_session import STREAM_CLOSED, AgySession
 from app.config import Settings
 from app.events import Error, TextDelta, ToolStep, TurnDone
 from app.mcp_bridge import ConversationBridge, McpBridge, PendingCall
 from app.mcp_config import McpConfigManager
 from app.openai_models import ChatCompletionRequest, ChatMessage
-from app.translate import build_prompt, message_text, split_system, usage_from_turn
+from app.translate import (
+    build_prompt,
+    materialize_messages,
+    message_text,
+    split_system,
+    usage_from_turn,
+)
 
 logger = logging.getLogger("agi.conv")
 
@@ -105,10 +112,17 @@ class ExpiredContinuation(Exception):
 
 
 class ConversationManager:
-    def __init__(self, mcp: McpBridge, mcp_config: McpConfigManager, settings: Settings) -> None:
+    def __init__(
+        self,
+        mcp: McpBridge,
+        mcp_config: McpConfigManager,
+        settings: Settings,
+        agents: Optional[AgentPluginManager] = None,
+    ) -> None:
         self.mcp = mcp
         self.mcp_config = mcp_config
         self.settings = settings
+        self.agents = agents
         self._conversations: dict[str, Conversation] = {}
         self._pending_index: dict[str, str] = {}  # tool_call_id -> conv_id
         self._lock = asyncio.Lock()
@@ -152,9 +166,14 @@ class ConversationManager:
         workdir: Path,
     ) -> Conversation:
         convo, system = split_system(req.messages)
-        content = build_prompt(
-            convo, system, inject_system=self.settings.system_prompt_injection
-        )
+        agent = None
+        if system and self.settings.system_prompt_via_agent and self.agents is not None:
+            agent = await self.agents.ensure_agent(system)
+        if self.settings.image_input:
+            convo = materialize_messages(convo, workdir)
+        # No agent (mode off, or plugin dir unwritable) → automatic fallback:
+        # the system message rides as an instruction preamble instead.
+        content = build_prompt(convo, system, inject_system=agent is None)
 
         async with self._lock:
             conv_id = self._next_conv_id()
@@ -176,6 +195,7 @@ class ConversationManager:
             model=model,
             workdir=workdir,
             prompt=prompt,
+            agent=agent,
             # The proc must survive suspensions (blocked in our MCP call while
             # hermes runs the tool), so its own ceiling exceeds one request's.
             print_timeout_s=self.settings.request_timeout_s + self.settings.suspended_ttl_s,

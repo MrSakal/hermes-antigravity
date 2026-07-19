@@ -39,6 +39,8 @@ from app.translate import (
     build_prompt,
     completion_response,
     finish_chunk,
+    materialize_messages,
+    message_text_with_images,
     new_completion_id,
     now,
     role_chunk,
@@ -82,15 +84,29 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
 
     cache: ConversationCache = request.app.state.conv_cache
 
+    # System prompt → managed agent (--agent <slug>); falls back to preamble
+    # injection when disabled or the plugin dir cannot be written. The slug is
+    # deterministic from the prompt, so cache-hit resumes recompute the same one.
+    convo, system = split_system(req.messages)
+    agent = None
+    if system and settings.system_prompt_via_agent:
+        agent = await request.app.state.agent_plugin.ensure_agent(system)
+
     # ── conversation-cache hit: resume with only the newest user message ─────
     hit = cache.lookup(req.messages)
     if hit is not None:
-        prompt = hit.new_user_text
+        prompt = (
+            message_text_with_images(req.messages[-1], workdir)
+            if settings.image_input else hit.new_user_text
+        )
         conversation_id = hit.conversation_id
         logger.info("conv-cache hit → resuming agy conversation %s", conversation_id)
     else:
-        convo, system = split_system(req.messages)
-        prompt = build_prompt(convo, system, inject_system=settings.system_prompt_injection)
+        if settings.image_input:
+            convo = materialize_messages(convo, workdir)
+        # No agent (mode off, or plugin dir unwritable) → automatic fallback:
+        # the system message rides as an instruction preamble instead.
+        prompt = build_prompt(convo, system, inject_system=agent is None)
         conversation_id = None
 
     if not prompt.strip():
@@ -111,6 +127,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
         workdir=workdir,
         prompt=prompt,
         conversation_id=conversation_id,
+        agent=agent,
         print_timeout_s=settings.request_timeout_s,
         timing_log=settings.timing_log,
         timing_label="autonomous",

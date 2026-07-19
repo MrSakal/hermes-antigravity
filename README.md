@@ -27,9 +27,23 @@ follow-up turns resume it via `--conversation <id>`.
 - **Conversation cache:** a follow-up request whose history matches a previous
   turn resumes the stored agy conversation and sends only the newest user
   message — cheaper, and immune to the prompt-length cap (see below).
-- **System prompt injection** (default on): agy has no system-prompt flag, so
-  the request's system message rides at the top of the first turn as explicit
-  instructions.
+- **Real system prompts via managed agents** (default on): agy has no
+  system-prompt flag, but it does support custom agents. The request's system
+  message is materialized as an agent definition inside a server-managed plugin
+  (`~/.gemini/config/plugins/hermes-bridge/agents/hermes-<hash>.md`) and agy is
+  spawned with `--agent <slug>` — the agent body rides at true system-prompt
+  level, behaviorally overrides the CLI's built-in persona, and stays in effect
+  across conversation resumes. (Antigravity's base identity/environment context
+  remains present underneath — the equivalent of hermes-claude's
+  `--append-system-prompt` mode; a full "bare model" replacement is not
+  possible, see the deviations note below.) Fallback (when disabled or the
+  plugin dir is unwritable): the system message is injected as an instruction
+  preamble at the top of the first turn.
+- **Image input**: agy has no image flag and no stdin channel, but its builtin
+  file tools can view local images. Data-URL images in OpenAI `image_url`
+  content parts are written to `<workdir>/attachments/` (content-addressed,
+  deduplicated) and the prompt references the file so the model looks at it.
+  Remote `image_url` URLs are not fetched and are skipped.
 - **Markdown table flattening** (default on): rewrites pipe tables to fenced
   ASCII so they render in clients that don't support Markdown tables (Discord).
 - **Ollama / llama.cpp compatibility shims** so capability-probing frontends
@@ -92,9 +106,23 @@ AGI_DEFAULT_MODEL=Gemini 3.5 Flash (Medium)
 # agy takes the prompt as an argv argument (stdin is not supported); Windows
 # caps a command line at ~32,767 chars.
 AGI_MAX_PROMPT_CHARS=28000
-# Inject the request's system message as an instruction preamble (agy has no
-# --system-prompt flag; Antigravity's own identity stays active underneath).
-AGI_SYSTEM_PROMPT_INJECTION=true
+
+# ── System prompt via managed agent ──────────────────────────────────────────
+# Deliver the request's system message as a REAL system prompt: it is written
+# as an agent definition (agents/hermes-<hash>.md) into a server-managed plugin
+# and agy is spawned with --agent <slug>. The agent body overrides the CLI's
+# built-in persona and stays in effect across conversation resumes. When false
+# (or the plugin dir cannot be written) the system message automatically falls
+# back to an instruction preamble at the top of the first turn.
+AGI_SYSTEM_PROMPT_VIA_AGENT=true
+# AGI_AGENT_PLUGIN_PATH=~/.gemini/config/plugins/hermes-bridge
+AGI_AGENT_CACHE_MAX=64
+
+# ── Image input ──────────────────────────────────────────────────────────────
+# Write data-URL images from OpenAI image_url content parts to
+# <workdir>/attachments/ and reference the file in the prompt; agy's builtin
+# file tools let the (multimodal) model view them.
+AGI_IMAGE_INPUT=true
 
 # ── Conversation continuity ──────────────────────────────────────────────────
 # History-prefix -> agy conversation id cache: follow-ups send only the newest
@@ -146,7 +174,10 @@ AGI_TIMING_LOG=false
 | `AGI_DEFAULT_MODEL` | `Gemini 3.5 Flash (Medium)` | Model used when the request names none / an unknown one (exact `agy models` display name). |
 | `AGI_DEFAULT_EFFORT` | _(unset)_ | Effort used to pick a model variant (`low`/`medium`/`high`). |
 | `AGI_MAX_PROMPT_CHARS` | `28000` | Fresh-fold prompt cap (agy takes the prompt via argv; Windows limit ~32,767). |
-| `AGI_SYSTEM_PROMPT_INJECTION` | `true` | Inject the request's system message as an instruction preamble. |
+| `AGI_SYSTEM_PROMPT_VIA_AGENT` | `true` | Deliver the system message as a generated agent definition (`--agent <slug>`), overriding the CLI persona. Off/unwritable → automatic prompt-preamble fallback. |
+| `AGI_AGENT_PLUGIN_PATH` | `~/.gemini/config/plugins/hermes-bridge` | Managed agent-plugin directory override. |
+| `AGI_AGENT_CACHE_MAX` | `64` | Max generated agent files kept (LRU by mtime). |
+| `AGI_IMAGE_INPUT` | `true` | Materialize data-URL images as files under `<workdir>/attachments/` and reference them in the prompt. |
 | `AGI_CONVERSATION_CACHE_MAX` | `256` | Max entries in the history→conversation-id cache. |
 | `AGI_CONVERSATION_CACHE_TTL_S` | `3600` | Cache entry lifetime. |
 | `AGI_MANAGE_MCP_CONFIG` | `true` | Allow registering per-conversation entries in the shared MCP config (required for tool calling). |
@@ -267,6 +298,33 @@ There is no warm pool (and none is needed): agy's persistent backend daemon
 absorbs the cold start, so a per-turn subprocess spawn measures ~30–50 ms
 (versus ~2.5 s TTFT for a cold `claude` spawn in the sibling project).
 
+## The managed agent plugin
+
+For system-prompt delivery the server owns one plugin directory,
+`~/.gemini/config/plugins/hermes-bridge/` (override with
+`AGI_AGENT_PLUGIN_PATH`). Each distinct system prompt becomes
+`agents/hermes-<sha1[:12]>.md` — created on first use, discovered by agy at
+conversation start with no install step, reused on repeat requests and
+conversation resumes (the slug is deterministic), and pruned LRU beyond
+`AGI_AGENT_CACHE_MAX`. Only files matching the `hermes-<hash>.md` pattern are
+ever pruned; other plugins and hand-written agents are never touched. Set
+`AGI_SYSTEM_PROMPT_VIA_AGENT=false` to forbid touching the plugin dir — the
+system message then falls back to the prompt-preamble injection.
+
+Limits of the agent mechanism (verified against agy 1.1.4) — this is why
+hermes-claude's full `bare_model_mode` cannot be mapped:
+
+- The frontmatter `tools:` field is an **additive grant**, not an allowlist: it
+  is required to expose `call_mcp_tool` (hence the generated `tools: "*"`),
+  but listing a subset does NOT strip the builtin tools — an agent restricted
+  to `view_file` still calls `list_dir` freely. There is no `--tools ""`
+  equivalent.
+- The base Antigravity system context (identity, environment/workspace
+  details, date) stays underneath the agent prompt; there is no
+  `--exclude-dynamic-system-prompt-sections` equivalent. The agent persona
+  dominates behaviorally, matching hermes-claude's append mode
+  (`--append-system-prompt`), not its bare replace mode.
+
 ## Deploying as a service (systemd user unit)
 
 Example `~/.config/systemd/user/agi-server.service`:
@@ -307,7 +365,18 @@ Notes:
 
 ```bash
 .venv/bin/python -m pytest -q                    # unit tests (no CLI needed)
-.venv/bin/python tests/scripts/e2e_tool.py       # live: full tool loop, needs a running server
+```
+
+Live scripts (need the `agy` CLI signed in; the e2e ones also need a running
+server on `:8788`):
+
+```bash
+.venv/bin/python tests/scripts/e2e_autonomous.py # live: plain chat, stream + non-stream
+.venv/bin/python tests/scripts/e2e_tool.py       # live: full tool loop
+.venv/bin/python tests/scripts/smoke_session.py  # live: drives agy directly, 2 turns + resume
+.venv/bin/python tests/scripts/probe_mcp.py      # live: MCP bridge end-to-end (no server needed)
+tests/scripts/curl_nostream.sh                   # live: one-liner sanity checks
+tests/scripts/curl_stream.sh
 ```
 
 ### Benchmark
