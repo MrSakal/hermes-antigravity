@@ -2,17 +2,14 @@
 
 The list comes from the live catalog (``agy models``, see
 :mod:`app.model_catalog`) when it has loaded, else from the static fallback
-table. Both the OpenAI-friendly slugs (handy as a client ``default_model``) and
-the exact display names are listed, so a client can pick either; the model used
-per request is whatever the client sends, resolved through
-``config.resolve_model``.
+table. Discovery lists one CLI slug per variant; aliases remain valid inputs.
 """
 
 from __future__ import annotations
 
 from fastapi import APIRouter, Request
 
-from app.config import KNOWN_MODELS, _FAMILY_VARIANTS
+from app.config import _FAMILY_VARIANTS, resolve_model, UnknownModel
 from app.errors import OpenAIError
 from app.openai_models import ModelCard, ModelList
 
@@ -20,29 +17,31 @@ router = APIRouter()
 
 
 def _static_ids() -> list[str]:
-    slugs: list[str] = []
-    for family, variants in _FAMILY_VARIANTS.items():
-        slugs.append(family)  # bare family → medium/high/low preference
-        slugs.extend(f"{family}-{eff}" for eff in variants if eff)
-    return slugs + KNOWN_MODELS
+    return [f"{family}-{eff}" if eff else family
+            for family, variants in _FAMILY_VARIANTS.items() for eff in variants]
 
 
 def model_ids(request: Request) -> list[str]:
     catalog = getattr(request.app.state, "model_catalog", None)
-    if catalog is None or not catalog.loaded:
-        return _static_ids()
-    ids: list[str] = []
-    seen: set[str] = set()
-    for e in catalog.entries:
-        fam = e.family
-        if fam and fam not in seen:  # bare family slug first ("gemini-3.8-flash")
-            seen.add(fam)
-            ids.append(fam)
-        if e.slug not in seen:
-            seen.add(e.slug)
-            ids.append(e.slug)
-    ids.extend(e.display for e in catalog.entries)
-    return ids
+    return list(dict.fromkeys(catalog.slugs())) if catalog is not None and catalog.loaded else _static_ids()
+
+
+def known_model(model_id: str, request: Request) -> bool:
+    """Use completion alias resolution, but always reject unknown probe IDs."""
+    if not model_id or not model_id.strip():
+        return False
+    if model_id in model_ids(request):
+        return True
+    catalog = getattr(request.app.state, "model_catalog", None)
+    kwargs = {}
+    if catalog is not None and catalog.loaded:
+        kwargs = {"known_models": catalog.display_names(), "families": catalog.families()}
+    settings = request.app.state.settings.model_copy(update={"strict_model": True})
+    try:
+        resolve_model(model_id, settings, **kwargs)
+    except UnknownModel:
+        return False
+    return True
 
 
 @router.get("/v1/models", response_model=ModelList)
@@ -52,7 +51,7 @@ async def list_models(request: Request) -> ModelList:
 
 @router.get("/v1/models/{model_id}", response_model=ModelCard)
 async def get_model(model_id: str, request: Request) -> ModelCard:
-    if model_id not in model_ids(request):
+    if not known_model(model_id, request):
         raise OpenAIError(
             f"model {model_id!r} not found", status_code=404,
             type="invalid_request_error", param="model", code="model_not_found",

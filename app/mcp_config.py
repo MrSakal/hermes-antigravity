@@ -13,9 +13,9 @@ Rules:
 
 * **Never touch foreign keys.** Read-modify-write preserves every entry we did
   not create; writes are atomic (temp file + replace).
-* All mutations run under one asyncio lock (we are the only writer on our keys;
-  the IDE may rewrite the file concurrently, which the re-read-before-modify
-  tolerates).
+* Mutations use an asyncio lock and a POSIX advisory sidecar lock. Cooperating
+  processes serialize allocation and read-modify-replace; noncooperating IDE
+  writers can still race these transactions.
 * ``cleanup_stale`` removes leftover ``hermes*`` entries pointing at our port
   from a previous crashed run.
 """
@@ -23,6 +23,10 @@ Rules:
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import fcntl
+import socket
+from urllib.parse import urlsplit
 import json
 import logging
 import os
@@ -43,10 +47,12 @@ def default_config_path() -> Path:
 class McpConfigManager:
     """Owns the ``hermes*`` server-slot entries in the shared config file."""
 
-    def __init__(self, path: Optional[Path] = None) -> None:
+    def __init__(self, path: Optional[Path] = None, *, lock_timeout_s: float = 5.0) -> None:
         self.path = path or default_config_path()
+        self.lock_timeout_s = lock_timeout_s
         self._lock = asyncio.Lock()
-        self._owned: dict[str, str] = {}  # slot name -> conv_id
+        self._owned: dict[str, str] = {}  # slot name -> exact owner URL
+        self._leases: dict[str, int] = {}
 
     # ── file primitives ─────────────────────────────────────────────────────
 
@@ -63,6 +69,8 @@ class McpConfigManager:
         if not isinstance(data, dict):
             raise ValueError(f"unexpected shared MCP config shape in {self.path}")
         data.setdefault("mcpServers", {})
+        if not isinstance(data["mcpServers"], dict):
+            raise ValueError(f"unexpected mcpServers shape in {self.path}")
         return data
 
     def _write(self, data: dict) -> None:
@@ -76,6 +84,36 @@ class McpConfigManager:
             with_contextlib_suppress_unlink(tmp)
             raise
 
+    @contextlib.asynccontextmanager
+    async def _transaction(self):
+        # Lock a stable sidecar inode: replacing the JSON must not replace the lock.
+        async with asyncio.timeout(self.lock_timeout_s), self._lock:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            fd = os.open(str(self.path) + ".lock", os.O_CREAT | os.O_RDWR, 0o600)
+            try:
+                while True:
+                    try:
+                        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        break
+                    except BlockingIOError:
+                        await asyncio.sleep(0.01)
+                # No suspension points inside the read/modify/replace transaction.
+                yield
+            finally:
+                os.close(fd)
+
+    def _lease(self, slot: str) -> Optional[int]:
+        fd = os.open(str(self.path) + f".{slot}.lock", os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(fd)
+            return None
+        except BaseException:
+            os.close(fd)
+            raise
+        return fd
+
     # ── slot management ─────────────────────────────────────────────────────
 
     def _next_slot(self, servers: dict) -> str:
@@ -88,55 +126,82 @@ class McpConfigManager:
 
     async def add_conversation(self, conv_id: str, url: str) -> str:
         """Add a server entry for ``conv_id`` → returns the slot name."""
-        async with self._lock:
+        async with self._transaction():
             data = self._read()
             servers = data["mcpServers"]
             slot = self._next_slot(servers)
+            lease = self._lease(slot)
+            while lease is None:
+                # Another owner may have had its entry externally removed.
+                servers = dict(servers)
+                servers[slot] = None
+                slot = self._next_slot(servers)
+                lease = self._lease(slot)
+            servers = data["mcpServers"]
             servers[slot] = {"serverUrl": url}
-            self._write(data)
-            self._owned[slot] = conv_id
+            try:
+                self._write(data)
+            except BaseException:
+                os.close(lease)
+                raise
+            self._leases[slot] = lease
+            self._owned[slot] = url
             logger.info("mcp-config: added slot %s -> %s", slot, url)
             return slot
 
     async def remove_conversation(self, slot: str) -> None:
-        """Remove our entry for ``slot`` (foreign keys untouched)."""
-        async with self._lock:
+        """Delete only a slot whose current URL still matches our owner URL."""
+        async with self._transaction():
             if slot not in self._owned:
                 return
-            try:
-                data = self._read()
-            except (json.JSONDecodeError, ValueError):
-                self._owned.pop(slot, None)
-                return
-            if slot in data["mcpServers"]:
-                data["mcpServers"].pop(slot)
+            data = self._read()  # Refuse unreadable/corrupt data; retain ownership for retry.
+            spec = data["mcpServers"].get(slot)
+            if isinstance(spec, dict) and spec.get("serverUrl") == self._owned[slot]:
+                del data["mcpServers"][slot]
                 self._write(data)
-            self._owned.pop(slot, None)
-            logger.info("mcp-config: removed slot %s", slot)
+            self._owned.pop(slot)
+            os.close(self._leases.pop(slot))
 
     async def cleanup_stale(self, port: int) -> int:
-        """Drop leftover ``hermes*`` entries pointing at ``127.0.0.1:<port>``
-        (a previous run that crashed before cleanup). Returns count removed."""
-        marker = f"127.0.0.1:{port}/"
-        async with self._lock:
+        """Remove unleased leftovers at this exact loopback MCP endpoint.
+
+        A listening service makes legacy entries ambiguous, so preserve them.
+        Cooperating owners hold per-slot advisory leases until removal or exit.
+        """
+        async with self._transaction():
+            data = self._read()
             try:
-                data = self._read()
-            except (json.JSONDecodeError, ValueError):
-                return 0
+                with socket.create_connection(("127.0.0.1", port), timeout=0.05):
+                    return 0
+            except OSError:
+                pass
             servers = data["mcpServers"]
-            stale = [
-                name for name, spec in servers.items()
-                if _SLOT_RE.match(name)
-                and isinstance(spec, dict)
-                and marker in str(spec.get("serverUrl") or spec.get("url") or "")
-                and name not in self._owned
-            ]
-            for name in stale:
-                servers.pop(name)
-            if stale:
-                self._write(data)
-                logger.info("mcp-config: cleaned %d stale slot(s): %s", len(stale), stale)
-            return len(stale)
+            stale = []
+            leases = []
+            try:
+                for name, spec in servers.items():
+                    if not _SLOT_RE.fullmatch(name) or not isinstance(spec, dict):
+                        continue
+                    try:
+                        url = urlsplit(spec.get("serverUrl") or spec.get("url") or "")
+                        matches = (url.scheme == "http" and url.hostname == "127.0.0.1"
+                                   and url.port == port and url.path.startswith("/mcp/")
+                                   and url.username is None and url.password is None)
+                    except (ValueError, TypeError):
+                        continue
+                    if matches and name not in self._owned:
+                        lease = self._lease(name)
+                        if lease is not None:
+                            leases.append(lease)
+                            stale.append(name)
+                for name in stale:
+                    del servers[name]
+                if stale:
+                    self._write(data)
+                return len(stale)
+            finally:
+                for lease in leases:
+                    os.close(lease)
 
     async def remove_all(self) -> None:
         """Shutdown: remove every slot we own."""

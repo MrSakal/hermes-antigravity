@@ -155,6 +155,19 @@ def main():
     entries = json.loads(config.read_text()).get("mcpServers", {})
     leftovers = [key for key, value in entries.items() if f"127.0.0.1:{args.port}/mcp/" in str(value)]
     check("MCP slots cleaned", not leftovers, str(leftovers))
+    idle_keys = ("sessions_active", "sessions_waiting", "sessions_suspended",
+                 "http_active", "attachment_workspaces_pinned", "mcp_transport_sessions")
+    # PID exit precedes completion of ASGI teardown. Observe the actual release
+    # condition with the same bounded grace as disconnect/process cleanup above.
+    cleanup_deadline = time.monotonic() + 10
+    while True:
+        with urllib.request.urlopen(base + "/metrics", timeout=5) as response:
+            metrics = json.load(response)
+        if all(metrics.get(key) == 0 for key in idle_keys) or time.monotonic() >= cleanup_deadline:
+            break
+        time.sleep(.05)
+    check("all resource counters return to zero", all(metrics.get(key) == 0 for key in idle_keys),
+          str({key: metrics.get(key) for key in idle_keys}))
     print(f"RESULT: {sum(results)}/{len(results)} passed", flush=True)
     return 0 if all(results) else 1
 

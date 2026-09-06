@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import socket
 
 import pytest
 
@@ -46,14 +47,21 @@ async def test_concurrent_slots(cfg):
 
 
 async def test_cleanup_stale_only_our_port_and_pattern(cfg):
+    # Reserve a non-listening fixture port; never probe the live service port.
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    port = sock.getsockname()[1]
     data = json.loads(cfg.read_text(encoding="utf-8"))
-    data["mcpServers"]["hermes"] = {"serverUrl": "http://127.0.0.1:8788/mcp/dead"}
+    data["mcpServers"]["hermes"] = {"serverUrl": f"http://127.0.0.1:{port}/mcp/dead"}
     data["mcpServers"]["hermes7"] = {"serverUrl": "http://127.0.0.1:9999/mcp/other"}
     data["mcpServers"]["hermesx"] = {"serverUrl": "http://127.0.0.1:8788/mcp/notslot"}
     cfg.write_text(json.dumps(data), encoding="utf-8")
 
     mgr = McpConfigManager(cfg)
-    removed = await mgr.cleanup_stale(8788)
+    try:
+        removed = await mgr.cleanup_stale(port)
+    finally:
+        sock.close()
     assert removed == 1  # only "hermes" (matching port + slot pattern, unowned)
     left = json.loads(cfg.read_text(encoding="utf-8"))["mcpServers"]
     assert "hermes" not in left

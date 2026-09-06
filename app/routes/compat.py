@@ -16,7 +16,7 @@ from fastapi import APIRouter, Request, Response, status
 from pydantic import BaseModel
 
 from app.openai_models import ModelList
-from app.routes.models import list_models, model_ids
+from app.routes.models import list_models, model_ids, known_model
 
 router = APIRouter()
 
@@ -81,8 +81,7 @@ class ShowRequest(BaseModel):
 @router.post("/api/show")
 async def api_show(body: ShowRequest, request: Request, response: Response) -> dict:
     requested = body.model or body.name
-    ids = await _model_ids(request)
-    if not requested or requested not in ids:
+    if not requested or not known_model(requested, request):
         response.status_code = status.HTTP_404_NOT_FOUND
         return {"error": f"model {requested!r} not found"}
     return {

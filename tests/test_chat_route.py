@@ -115,8 +115,8 @@ async def test_conv_cache_roundtrip(client, fake_agy):
     ]
     r2 = await http.post("/v1/chat/completions", json={"messages": nxt})
     assert r2.status_code == 200
-    # A hit stores the extended transcript as a new entry.
-    assert len(application.state.conv_cache) == 2
+    # A claim consumes the old mutable prefix; only its replacement remains.
+    assert len(application.state.conv_cache) == 1
 
 
 async def test_tools_request_without_tool_use_completes(client, fake_agy, tmp_path):
@@ -367,7 +367,7 @@ async def test_nonstream_client_disconnect_kills_subprocess(client, fake_agy, mo
     from fastapi import Request
 
     async def always_gone(self):
-        return True
+        return bool(created)  # disconnect AFTER admission/start, not while queued
 
     monkeypatch.setattr(Request, "is_disconnected", always_gone)
 
@@ -386,9 +386,10 @@ async def test_models_endpoint_static_fallback(client):
     http, _ = client
     r = await http.get("/v1/models")
     ids = [m["id"] for m in r.json()["data"]]
-    assert "gemini-3.8-flash" in ids
+    assert "gemini-3.8-flash" not in ids  # family remains an input alias only
     assert "gemini-3.8-flash-high" in ids
-    assert "Gemini 3.8 Flash (Medium)" in ids
+    assert "Gemini 3.8 Flash (Medium)" not in ids
+    assert "gemini-3.8-flash-medium" in ids
     assert "claude-opus-4-6-thinking" in ids  # agy's own slug spelling
 
 
@@ -397,9 +398,10 @@ async def test_models_endpoint_live_catalog(client):
     async with application.router.lifespan_context(application):
         r = await http.get("/v1/models")
         ids = [m["id"] for m in r.json()["data"]]
-        assert "gemini-9.9-flash" in ids  # bare family
+        assert "gemini-9.9-flash" not in ids  # bare family is an input alias
         assert "gemini-9.9-flash-medium" in ids
-        assert "Gemini 9.9 Flash (Low)" in ids
+        assert "Gemini 9.9 Flash (Low)" not in ids
+        assert "gemini-9.9-flash-low" in ids
         assert "gemini-3.8-flash" not in ids  # static table not mixed in
         r = await http.get("/v1/models/gemini-9.9-flash")
         assert r.status_code == 200

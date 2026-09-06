@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hmac
+import ipaddress
 import logging
 from collections.abc import AsyncIterator
 
@@ -27,6 +28,8 @@ from app.errors import OpenAIError
 from app.mcp_bridge import McpBridge
 from app.mcp_config import McpConfigManager
 from app.model_catalog import ModelCatalog
+from app.resources import Admission, AttachmentStore, Metrics
+from app.request_guard import RequestGuard
 from app.routes import chat, compat, health, models
 
 logger = logging.getLogger("agi")
@@ -50,6 +53,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     else:
         logger.warning("model catalog: using static fallback table (%d models)", len(KNOWN_MODELS))
     catalog_task = None
+    attachment_task = asyncio.create_task(app.state.attachments.gc_loop(), name="agi-attachments")
     if settings.model_catalog_refresh_s > 0:
         catalog_task = asyncio.create_task(catalog.refresh_loop(), name="agi-model-catalog")
     async with mcp.lifespan():
@@ -61,7 +65,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         try:
             yield
         finally:
-            for task in (gc_task, catalog_task):
+            for task in (gc_task, catalog_task, attachment_task):
                 if task is not None:
                     task.cancel()
                     with contextlib.suppress(asyncio.CancelledError):
@@ -90,6 +94,10 @@ def create_app() -> FastAPI:
 
     app = FastAPI(title="antigravity-interface", lifespan=lifespan)
     app.state.settings = settings
+    app.state.metrics = Metrics()
+    app.state.admission = Admission(settings.max_sessions, settings.max_queued_requests,
+                                    settings.admission_timeout_s, app.state.metrics)
+    app.state.attachments = AttachmentStore(settings)
     app.state.mcp = mcp
     app.state.conv_cache = ConversationCache(
         max_entries=settings.conversation_cache_max,
@@ -128,6 +136,7 @@ def create_app() -> FastAPI:
     # disconnect watch downstream always see "still connected". The MCP mount
     # is intentionally exempt — it is reached only by the local agy subprocess
     # over loopback and carries no token.
+    app.add_middleware(RequestGuard, settings=settings, metrics=app.state.metrics)
     app.add_middleware(_BearerAuth, api_key=settings.api_key)
     return app
 
@@ -138,10 +147,21 @@ class _BearerAuth:
         self.api_key = api_key
 
     async def __call__(self, scope, receive, send) -> None:
+        path = scope.get("path", "")
+        if scope["type"] == "http" and (path == "/mcp" or path.startswith("/mcp/")):
+            client = scope.get("client")
+            try:
+                local = bool(client) and ipaddress.ip_address(client[0]).is_loopback
+            except ValueError:
+                local = False
+            if not local:
+                await OpenAIError("MCP is loopback-only", status_code=403,
+                                  code="local_only").json_response()(scope, receive, send)
+                return
         if (
             scope["type"] == "http"
             and self.api_key
-            and (scope.get("path") or "").startswith("/v1")
+            and (path.startswith(("/v1", "/api")) or path in {"/readyz", "/metrics"})
         ):
             header = ""
             for k, v in scope.get("headers") or ():
@@ -149,7 +169,7 @@ class _BearerAuth:
                     header = v.decode("latin-1")
                     break
             token = header[7:] if header[:7].lower() == "bearer " else ""
-            if not hmac.compare_digest(token, self.api_key):
+            if not hmac.compare_digest(token.encode("utf-8"), self.api_key.encode("utf-8")):
                 response = OpenAIError(
                     "missing or invalid api key",
                     status_code=401,

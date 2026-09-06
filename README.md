@@ -52,8 +52,8 @@ follow-up turns resume it via `--conversation <id>`.
   file tools can view local images. Data-URL images in OpenAI `image_url`
   content parts are written to `<workdir>/attachments/` (content-addressed,
   deduplicated) and the prompt references the file so the model looks at it.
-  Remote `image_url` URLs are not fetched and are skipped.
-- **Markdown table flattening** (default on): rewrites pipe tables to fenced
+  Remote URLs, invalid base64, and oversized images are rejected explicitly.
+- **Markdown table flattening** (opt-in): rewrites pipe tables to fenced
   ASCII so they render in clients that don't support Markdown tables (Discord).
 - **Ollama / llama.cpp compatibility shims** so capability-probing frontends
   (Open WebUI, etc.) accept the server.
@@ -122,10 +122,10 @@ automatically. The systemd example below uses `EnvironmentFile`.
 | `AGI_CONVERSATION_CACHE_TTL_S` | `3600` | Cache entry lifetime. |
 | `AGI_MANAGE_MCP_CONFIG` | `true` | Allow registering per-conversation entries in the shared MCP config (required for tool calling). |
 | `AGI_MCP_CONFIG_PATH` | `~/.gemini/config/mcp_config.json` | Shared Antigravity MCP config location override. |
-| `AGI_FLATTEN_MARKDOWN_TABLES` | `true` | Rewrite pipe tables to fenced ASCII. |
+| `AGI_FLATTEN_MARKDOWN_TABLES` | `false` | Optional bounded pipe-table to ASCII conversion. |
 | `AGI_DEFAULT_WORKDIR` | `~/agi-workspace` | Working dir granted to agy via `--add-dir` (and used as cwd). |
 | `AGI_ALLOWED_WORKDIR_ROOTS` | `[]` | JSON list of extra roots a per-request `workdir` may resolve under. |
-| `AGI_REQUEST_TIMEOUT_S` | `600` | Per-turn upstream timeout. |
+| `AGI_REQUEST_TIMEOUT_S` | `600` | Absolute HTTP turn deadline, including queue/startup time. |
 | `AGI_SUSPENDED_TTL_S` | `300` | How long a tool-suspended conversation may wait for its results before GC. |
 | `AGI_IDLE_SESSION_TTL_S` | `900` | Idle conversation eviction age. |
 | `AGI_GC_INTERVAL_S` | `30` | GC sweep interval. |
@@ -163,6 +163,8 @@ remote clients), set a long random `AGI_API_KEY` and put it behind TLS. Binding
 
 **Health / info**
 - `GET /healthz` — `{"status":"ok",…}` (a JSON 404 here means the server is up but the route moved)
+- `GET /readyz` — CLI/catalog readiness (503 until available; not an inference probe)
+- `GET /metrics` — bounded-window TTFT/duration statistics, session/queue counts and errors
 - `GET /` — service info
 
 **Ollama / llama.cpp compatibility** (for capability-probing frontends)
@@ -220,6 +222,15 @@ suffix) picking the variant:
 Unknown IDs return **400 `model_not_found`** by default. Set `AGI_STRICT_MODEL=false`
 only when legacy default-model fallback is intentional. `/v1/models` is the live
 source of truth; the table above illustrates aliases, not a frozen catalog.
+Discovery returns one canonical CLI slug per real variant. Display names and
+family aliases remain accepted as input but are not advertised as duplicate models.
+The standard `reasoning_effort` field is accepted alongside legacy `effort`;
+conflicting values are rejected.
+
+### Hardening and capacity
+
+See [hardening and operational limits](docs/hardening.md) for session admission,
+request/image/schema caps, attachment retention, error semantics, and migration.
 
 ## The shared MCP config
 

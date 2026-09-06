@@ -79,10 +79,12 @@ class ChatCompletionRequest(BaseModel):
     temperature: Optional[float] = None
     top_p: Optional[float] = None
     max_tokens: Optional[int] = None
+    max_completion_tokens: Optional[int] = None
     stop: Optional[Union[str, list[str]]] = None
     # Non-standard CCI extensions:
     workdir: Optional[str] = None
     effort: Optional[str] = None
+    reasoning_effort: Optional[Literal["low", "medium", "high"]] = None
 
 
 # ── Response (non-streaming) ──────────────────────────────────────────────—

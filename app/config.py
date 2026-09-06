@@ -8,11 +8,12 @@ a local Antigravity login (shared with the Antigravity IDE) with no API key.
 from __future__ import annotations
 
 import os
+import ipaddress
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal, Optional
 
-from pydantic import field_validator
+from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # Static fallback catalog — what `agy models` reported on 1.1.27 (Gemini 3.5
@@ -115,6 +116,23 @@ class Settings(BaseSettings):
     # context on the largest models); requests above it get 400
     # context_length_exceeded instead of a doomed upstream call.
     max_prompt_bytes: int = 4_000_000
+    max_request_bytes: int = Field(default=32_000_000, gt=0)
+    body_timeout_s: float = Field(default=30.0, gt=0)
+    max_image_bytes: int = Field(default=8_000_000, gt=0)
+    max_total_image_bytes: int = Field(default=16_000_000, gt=0)
+    max_images: int = Field(default=16, ge=0)
+    max_tools: int = Field(default=128, ge=0)
+    max_tool_schema_bytes: int = Field(default=1_000_000, gt=0)
+    max_sessions: int = Field(default=8, gt=0)
+    max_suspended_sessions: int = Field(default=4, gt=0)
+    max_queued_requests: int = Field(default=16, ge=0)
+    admission_timeout_s: float = Field(default=5.0, gt=0)
+    event_queue_size: int = Field(default=256, gt=0)
+    max_pending_tool_calls: int = Field(default=32, gt=0)
+    stdin_timeout_s: float = Field(default=30.0, gt=0)
+    attachment_ttl_s: int = Field(default=86400, gt=0)
+    attachment_max_bytes: int = Field(default=256_000_000, gt=0)
+    attachment_gc_interval_s: int = Field(default=300, gt=0)
     # Never let user content be interpreted as an agy slash command / skill.
     disable_slash_commands: bool = True
 
@@ -186,7 +204,7 @@ class Settings(BaseSettings):
     # ── Output formatting ──────────────────────────────────────────────────—
     # Rewrite Markdown pipe tables to fenced monospace ASCII so they render in
     # clients (e.g. Discord) that don't support Markdown tables.
-    flatten_markdown_tables: bool = True
+    flatten_markdown_tables: bool = False
 
     # ── Workspace ──────────────────────────────────────────────────────────—
     default_workdir: Path = Path("~/agi-workspace").expanduser()
@@ -236,7 +254,12 @@ class Settings(BaseSettings):
     def is_loopback_host(self) -> bool:
         """True when the bind host only accepts connections from this machine."""
         h = self.host.strip().lower()
-        return h in {"localhost", "::1", "0:0:0:0:0:0:0:1"} or h.startswith("127.")
+        if h == 'localhost':
+            return True
+        try:
+            return ipaddress.ip_address(h).is_loopback
+        except ValueError:
+            return False
 
     def resolved_workdir_roots(self) -> list[Path]:
         """The set of allowed workspace roots as resolved absolute paths."""

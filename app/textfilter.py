@@ -148,75 +148,126 @@ class TableFlattener:
     inside a ```` ``` ```` fence are never treated as tables.
     """
 
-    def __init__(self) -> None:
-        self._line = ""          # chars of the current line, buffered
-        self._decided: bool | None = None  # None=undecided, True=table cand., False=prose
-        self._table: list[str] = []  # completed candidate lines of the current block
+    def __init__(self, *, max_pending_chars: int = 65536) -> None:
+        self.max_pending_chars = max(1, max_pending_chars)
+        self._line: list[str] = []
+        self._line_size = 0
+        self._decided: bool | None = None
+        self._table: list[str] = []
+        self._table_size = 0
         self._in_fence = False
+        self._prefix = ""
+        self._raw = False
 
     def feed(self, text: str) -> str:
+        if self._raw:
+            return text
         out: list[str] = []
-        for ch in text:
-            if ch == "\n":
-                self._newline(out)
-            else:
-                self._char(ch, out)
+        parts = text.split("\n")
+        for i, part in enumerate(parts):
+            if self._raw:
+                out.append(part)
+                if i < len(parts) - 1:
+                    out.append("\n")
+                continue
+            self._chunk(part, out)
+            if i < len(parts) - 1:
+                if self._raw:
+                    out.append("\n")
+                else:
+                    self._newline(out)
         return "".join(out)
 
-    def _char(self, ch: str, out: list[str]) -> None:
-        self._line += ch
+    def _chunk(self, text: str, out: list[str]) -> None:
+        if not text:
+            return
         if self._decided is None:
-            if ch.isspace():
-                return  # still in leading whitespace
-            if ch == "|" and not self._in_fence:
-                self._decided = True  # table candidate; keep buffering silently
-            else:
-                self._decided = False
-                out.append(self._flush_table())
-                out.append(self._line)  # buffered leading ws + this char
-        elif self._decided is False:
-            out.append(ch)
+            stripped = text.lstrip()
+            if stripped:
+                self._decided = stripped.startswith("|") and not self._in_fence
+                if not self._decided:
+                    out.append(self._flush_table())
+                    out.extend(self._line)
+                    self._line = []
+                    self._line_size = 0
+                self._prefix = stripped[:3]
+        elif self._decided is False and len(self._prefix) < 3:
+            self._prefix += text[:3 - len(self._prefix)]
+        if self._decided is False:
+            out.append(text)
+            return
+        if self._table_size + self._line_size + len(text) > self.max_pending_chars:
+            # Once a pending block overflows, preserve all remaining bytes raw.
+            # Never reinterpret a suffix of the same oversized table as a table.
+            out.extend(self._table)
+            out.extend(self._line)
+            out.append(text)
+            self._table = []
+            self._line = []
+            self._table_size = self._line_size = 0
+            self._raw = True
+            return
+        self._line.append(text)
+        self._line_size += len(text)
 
     def _newline(self, out: list[str]) -> None:
         if self._decided is True:
-            self._table.append(self._line)
+            if self._table_size + self._line_size + 1 > self.max_pending_chars:
+                out.extend(self._table)
+                out.extend(self._line)
+                out.append("\n")
+                self._table = []
+                self._table_size = 0
+                self._raw = True
+            else:
+                self._table.append("".join(self._line) + "\n")
+                self._table_size += self._line_size + 1
         elif self._decided is False:
             out.append("\n")
-        else:  # undecided: blank / whitespace-only line ends any pending table
+        else:
             out.append(self._flush_table())
-            out.append(self._line + "\n")
-        if self._line.lstrip().startswith("```"):
+            out.extend(self._line)
+            out.append("\n")
+        if self._prefix.startswith("```"):
             self._in_fence = not self._in_fence
-        self._line = ""
+        self._line = []
+        self._line_size = 0
+        self._prefix = ""
         self._decided = None
 
     def _flush_table(self) -> str:
-        if not self._table:
-            return ""
         rows, self._table = self._table, []
+        self._table_size = 0
         if _looks_like_table(rows):
-            return render_ascii_table(rows)
-        return "".join(r + "\n" for r in rows)
+            # Ragged rows can amplify a small input into a huge padded grid.
+            # Estimate its size in linear input work before allocating that grid.
+            widths: list[int] = []
+            for row in rows:
+                for i, cell in enumerate(_split_cells(row)):
+                    if i == len(widths):
+                        widths.append(len(cell))
+                    else:
+                        widths[i] = max(widths[i], len(cell))
+            projected = (sum(widths) + 3 * len(widths) + 1) * len(rows) + 8
+            if projected <= self.max_pending_chars * 4:
+                return render_ascii_table(rows)
+        return "".join(rows)
 
     def flush(self) -> str:
-        out: list[str] = []
+        if self._raw:
+            return ""
         if self._decided is True:
-            rows = self._table + [self._line]
-            self._table = []
-            if _looks_like_table(rows):
-                out.append(render_ascii_table(rows))
-            else:
-                # Non-table candidate flushed at EOF: the buffered rows each had
-                # a source newline but the trailing partial line did not, so join
-                # with newlines WITHOUT appending a phantom one at the end.
-                out.append("\n".join(rows))
+            self._table.append("".join(self._line))
+            result = self._flush_table()
         elif self._decided is None:
-            out.append(self._flush_table())
-            out.append(self._line)
-        # decided False: the line was already streamed out
-        self._line = ""
+            result = self._flush_table() + "".join(self._line)
+        else:
+            result = ""
+        self._line = []
+        self._line_size = 0
+        self._prefix = ""
         self._decided = None
-        return "".join(out)
+        return result
 
 
 # ── combined filter ──────────────────────────────────────────────────────────

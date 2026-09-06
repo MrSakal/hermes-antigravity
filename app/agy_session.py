@@ -29,6 +29,8 @@ import asyncio
 import contextlib
 import json
 import logging
+import os
+import signal
 import time
 
 from collections import deque
@@ -37,7 +39,7 @@ from typing import Optional, Union
 
 import anyio
 
-from app.events import ChatEvent, parse_line
+from app.events import ChatEvent, Error, parse_line
 from app.timing import log_spawn
 
 logger = logging.getLogger("agi.session")
@@ -82,7 +84,13 @@ class AgySession:
         disable_slash_commands: bool = True,
         timing_log: bool = False,
         timing_label: str = "session",
+        event_queue_size: int = 256,
+        stdin_timeout_s: float = 30,
     ) -> None:
+        if event_queue_size < 1 or stdin_timeout_s <= 0:
+            raise ValueError("event_queue_size and stdin_timeout_s must be positive")
+        self.event_queue_size = event_queue_size
+        self.stdin_timeout_s = stdin_timeout_s
         self.agy_bin = agy_bin
         self.model = model
         self.workdir = str(workdir)
@@ -95,11 +103,16 @@ class AgySession:
         self.timing_label = timing_label
 
         self._proc: Optional[asyncio.subprocess.Process] = None
-        self._queue: asyncio.Queue[Union[ChatEvent, object]] = asyncio.Queue()
+        self._queue: asyncio.Queue[Union[ChatEvent, object]] = asyncio.Queue(maxsize=event_queue_size)
         self._reader_task: Optional[asyncio.Task[None]] = None
         self._stderr_task: Optional[asyncio.Task[None]] = None
         self._stdin_task: Optional[asyncio.Task[None]] = None
         self._closed = False
+        self._eof = False
+        self._available = asyncio.Event()
+        self._writer_error: Optional[Error] = None
+        self._close_task: Optional[asyncio.Task[None]] = None
+        self._pgid: Optional[int] = None
         self._pushback: list[Union[ChatEvent, object]] = []
         # Diagnostics: last raw stdout lines the parser skipped + stderr tail.
         self.raw_tail: deque[str] = deque(maxlen=5)
@@ -135,6 +148,8 @@ class AgySession:
 
     async def start(self) -> None:
         """Spawn the subprocess (idempotent) and launch reader/stderr tasks."""
+        if self._closed:
+            raise RuntimeError("session is closed")
         if self._proc is not None:
             return
         args = self._build_args()
@@ -152,12 +167,15 @@ class AgySession:
                 stderr=asyncio.subprocess.PIPE,
                 cwd=self.workdir,
                 limit=_READ_LIMIT,
+                start_new_session=(os.name == "posix"),
             )
         except FileNotFoundError as e:
             raise RuntimeError(
                 "agy CLI not found on PATH — install the Antigravity CLI "
                 "(https://antigravity.google/docs/cli-install) and sign in"
             ) from e
+        if os.name == "posix":
+            self._pgid = self._proc.pid
         log_spawn(self.timing_log, self.timing_label, (time.monotonic() - spawn_t0) * 1000)
         self._reader_task = asyncio.create_task(self._read_stdout(), name="agy-stdout")
         self._stderr_task = asyncio.create_task(self._read_stderr(), name="agy-stderr")
@@ -174,13 +192,18 @@ class AgySession:
         assert self._proc is not None and self._proc.stdin is not None
         stdin = self._proc.stdin
         try:
-            stdin.write(payload)
-            await stdin.drain()
-        except (BrokenPipeError, ConnectionResetError) as e:
-            # agy exited before reading the prompt (bad flag, auth failure, …);
-            # the stdout/stderr tails carry the reason.
-            self.stderr_tail.append(f"stdin closed early: {e.__class__.__name__}")
-            logger.debug("agy stdin write failed: %s", e)
+            async with asyncio.timeout(self.stdin_timeout_s):
+                for offset in range(0, len(payload), 65536):
+                    stdin.write(payload[offset:offset + 65536])
+                    await stdin.drain()
+        except Exception as e:
+            message = f"stdin write failed: {type(e).__name__}: {e}"
+            self.stderr_tail.append(message)
+            self._writer_error = Error(message=message)
+            self._available.set()
+            # A blocked/failed writer must also stop the upstream process.
+            if self._close_task is None:
+                self._close_task = asyncio.create_task(self._close_impl())
         finally:
             with contextlib.suppress(Exception):
                 stdin.close()
@@ -205,11 +228,15 @@ class AgySession:
                 line = raw.decode("utf-8", "replace")
                 ev = parse_line(line)
                 if ev is not None:
+                    if self._closed:
+                        break
                     await self._queue.put(ev)
+                    self._available.set()
                 elif line.strip():
                     self.raw_tail.append(line.strip()[:500])
         finally:
-            await self._queue.put(STREAM_CLOSED)
+            self._eof = True
+            self._available.set()
 
     async def _read_stderr(self) -> None:
         assert self._proc is not None and self._proc.stderr is not None
@@ -237,13 +264,23 @@ class AgySession:
     ) -> Union[ChatEvent, object, None]:
         """Pop the next event. Returns :data:`STREAM_CLOSED` at EOF, or ``None``
         if ``timeout`` elapses first."""
-        if self._pushback:
-            return self._pushback.pop(0)
+        async def take():
+            while True:
+                if self._writer_error is not None:
+                    error, self._writer_error = self._writer_error, None
+                    return error
+                if self._pushback:
+                    return self._pushback.pop(0)
+                if not self._queue.empty():
+                    return self._queue.get_nowait()
+                if self._eof or self._closed:
+                    return STREAM_CLOSED
+                self._available.clear()
+                await self._available.wait()
         try:
-            if timeout is None:
-                return await self._queue.get()
-            return await asyncio.wait_for(self._queue.get(), timeout=timeout)
-        except asyncio.TimeoutError:
+            async with asyncio.timeout(timeout):
+                return await take()
+        except TimeoutError:
             return None
 
     def diagnostics(self) -> str:
@@ -258,37 +295,48 @@ class AgySession:
     # ── shutdown ──────────────────────────────────────────────────────────—
 
     async def aclose(self) -> None:
-        # Starlette uses level cancellation; shield all cleanup awaits.
+        """Finish shared teardown even if callers are repeatedly cancelled."""
         with anyio.CancelScope(shield=True):
-            await self._close_impl()
+            if self._close_task is None:
+                self._close_task = asyncio.create_task(self._close_impl())
+            cancelled = False
+            while True:
+                try:
+                    await asyncio.shield(self._close_task)
+                    break
+                except asyncio.CancelledError:
+                    if self._close_task.cancelled():
+                        raise  # never spin on an independently cancelled teardown
+                    cancelled = True
+            if cancelled:
+                raise asyncio.CancelledError
+
+    def _signal_owned(self, sig: int) -> None:
+        try:
+            if self._pgid is not None:
+                os.killpg(self._pgid, sig)
+            elif self._proc is not None and self._proc.returncode is None:
+                self._proc.send_signal(sig)
+        except ProcessLookupError:
+            pass
 
     async def _close_impl(self) -> None:
-        """Terminate the process and cancel reader/stderr/stdin tasks.
-
-        Called within a shielded AnyIO scope so repeated Starlette cancellation
-        cannot interrupt teardown.
-        """
-        if self._closed:
-            return
         self._closed = True
-        if self._stdin_task is not None and not self._stdin_task.done():
-            self._stdin_task.cancel()
+        self._available.set()
+        tasks = [t for t in (self._reader_task, self._stderr_task, self._stdin_task)
+                 if t is not None]
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
         proc = self._proc
-        if proc is not None and proc.returncode is None:
-            try:
-                proc.terminate()
-            except ProcessLookupError:
-                pass
+        if proc is not None:
+            self._signal_owned(signal.SIGTERM)
             try:
                 await asyncio.wait_for(proc.wait(), timeout=5)
             except asyncio.TimeoutError:
-                try:
-                    proc.kill()
-                except ProcessLookupError:
-                    pass
-                await proc.wait()
-        for task in (self._reader_task, self._stderr_task, self._stdin_task):
-            if task is not None:
-                task.cancel()
-                with contextlib.suppress(asyncio.CancelledError, Exception):
-                    await task
+                pass
+            finally:
+                # The leader may already have exited while descendants remain.
+                self._signal_owned(signal.SIGKILL)
+                self._pgid = None
+            await proc.wait()

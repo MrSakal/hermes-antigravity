@@ -95,7 +95,6 @@ async def test_full_tool_cycle(mgr, fake_agy, tmp_path):
             {"role": "assistant", "tool_calls": [pc.openai_tool_call()]},
             {"role": "tool", "tool_call_id": pc.id, "content": "sunny, 28C"},
         ],
-        "tools": [],
     })
     assert ConversationManager.is_continuation(cont)
     resumed = await mgr.resume(cont)
@@ -111,8 +110,8 @@ async def test_parallel_batch_collected(mgr, fake_agy):
     fake_agy("hang")
     conv = await mgr.create(make_request(), model=None,
                             workdir=mgr.settings.default_workdir)
-    t1 = asyncio.create_task(conv.bridge.dispatch("f1", {"a": 1}))
-    t2 = asyncio.create_task(conv.bridge.dispatch("f2", {"b": 2}))
+    t1 = asyncio.create_task(conv.bridge.dispatch("get_weather", {"a": 1}))
+    t2 = asyncio.create_task(conv.bridge.dispatch("get_weather", {"b": 2}))
     chunks = await collect_turn(mgr, conv)
     calls = [c for c in chunks if isinstance(c, ToolCallsChunk)]
     assert len(calls) == 1 and len(calls[0].calls) == 2
@@ -155,7 +154,7 @@ async def test_gc_reaps_suspended(mgr, fake_agy, tmp_path):
     fake_agy("hang")
     conv = await mgr.create(make_request(), model=None,
                             workdir=mgr.settings.default_workdir)
-    dispatch_task = asyncio.create_task(conv.bridge.dispatch("f", {}))
+    dispatch_task = asyncio.create_task(conv.bridge.dispatch("get_weather", {}))
     await collect_turn(mgr, conv)
     assert conv.state == SUSPENDED
 
@@ -171,7 +170,7 @@ async def test_double_continuation_rejected(mgr, fake_agy):
     fake_agy("hang")
     conv = await mgr.create(make_request(), model=None,
                             workdir=mgr.settings.default_workdir)
-    dispatch_task = asyncio.create_task(conv.bridge.dispatch("f", {}))
+    dispatch_task = asyncio.create_task(conv.bridge.dispatch("get_weather", {}))
     chunks = await collect_turn(mgr, conv)
     pc = next(c for c in chunks if isinstance(c, ToolCallsChunk)).calls[0]
 
