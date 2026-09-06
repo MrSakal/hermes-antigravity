@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import stat
 import sys
 from pathlib import Path
 
@@ -35,3 +37,17 @@ def fake_agy(monkeypatch):
             monkeypatch.setenv(k, v)
 
     return set_mode
+
+
+@pytest.fixture
+def fake_agy_bin(tmp_path) -> str:
+    """An executable wrapper so code that execs ``agy_bin`` directly (the
+    model catalog's ``agy models``) hits tests/fake_agy.py too."""
+    wrapper = tmp_path / "agy-fake"
+    if os.name == "nt":  # pragma: no cover
+        wrapper = wrapper.with_suffix(".cmd")
+        wrapper.write_text(f'@"{sys.executable}" "{FAKE_AGY}" %*\n')
+    else:
+        wrapper.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{FAKE_AGY}" "$@"\n')
+        wrapper.chmod(wrapper.stat().st_mode | stat.S_IXUSR)
+    return str(wrapper)

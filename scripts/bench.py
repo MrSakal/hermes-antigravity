@@ -19,7 +19,7 @@ Scenarios (each repeated ``--iters`` times):
 
 Usage:
   .venv/bin/python scripts/bench.py [--port 8799] [--iters 3] [--out bench-baseline.json]
-                                    [--loop uvloop --http httptools] [--model gemini-3.5-flash]
+                                    [--loop uvloop --http httptools] [--model gemini-3.8-flash]
 """
 from __future__ import annotations
 

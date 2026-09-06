@@ -16,7 +16,7 @@ from pathlib import Path
 from app.agy_session import STREAM_CLOSED, AgySession
 from app.events import Error, Init, TextDelta, ToolStep, TurnDone
 
-MODEL = "Gemini 3.5 Flash (Medium)"
+MODEL = "Gemini 3.8 Flash (Medium)"
 WORKDIR = Path(tempfile.gettempdir()) / "agi_smoke_ws"
 
 

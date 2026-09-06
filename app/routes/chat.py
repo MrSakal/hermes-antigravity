@@ -1,24 +1,43 @@
-"""``POST /v1/chat/completions`` — autonomous (no-tool) path.
+"""``POST /v1/chat/completions``.
 
-Phase 1 handles requests with no external ``tools``: the OpenAI conversation is
-either resumed as an existing agy conversation (conversation-cache hit → only
-the newest user message is sent with ``--conversation <id>``) or folded into one
-prompt for a fresh conversation. The streamed text becomes SSE or a single JSON
-completion. The tool-passthrough path (suspend/resume via the MCP bridge) is
-layered on in Phase 2; any ``tools`` field is currently rejected as unsupported.
+Two paths:
+
+* **Autonomous** (no ``tools``): the OpenAI conversation is either resumed as
+  an existing agy conversation (conversation-cache hit → only the newest user
+  message is sent with ``--conversation <id>``) or folded into one prompt for a
+  fresh conversation. The streamed text becomes SSE or a single JSON completion.
+  The spawned agent carries the ``plain_chat_tools`` allowlist (default: read
+  only) — this path answers hermes' side calls on untrusted content.
+* **Tool passthrough** (``tools`` present, or a continuation carrying tool
+  results): suspend/resume via the MCP bridge, see :mod:`app.conversation`.
+
+Client disconnects: a streaming response is cancelled by Starlette when the
+client goes away (the ``finally`` closes the subprocess); a non-streaming
+request is not, so ``_collect`` polls ``request.is_disconnected()`` and kills
+the subprocess instead of letting it run to ``request_timeout_s`` for nobody.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 from collections.abc import AsyncIterator
+from typing import Optional
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 
 from app.agy_session import STREAM_CLOSED, AgySession
-from app.config import ensure_workdir, get_settings, resolve_model
+from app.config import (
+    PromptTooLarge,
+    Settings,
+    UnknownModel,
+    ensure_workdir,
+    get_settings,
+    resolve_model,
+)
+from app.config import check_prompt_size as _check_prompt_size
 from app.convcache import ConversationCache
 from app.conversation import (
     ConversationManager,
@@ -32,6 +51,7 @@ from app.conversation import (
 )
 from app.errors import OpenAIError, error_envelope
 from app.events import Error, Init, TextDelta, ToolStep, TurnDone
+from app.model_catalog import ModelCatalog
 from app.openai_models import ChatCompletionRequest
 from app.textfilter import OutputFilter
 from app.thinking import TurnThinking, default_brain_path
@@ -65,10 +85,47 @@ _SSE_HEADERS = {
 }
 
 
+class ClientDisconnected(Exception):
+    """The HTTP client went away while the turn was still running."""
+
+
+def resolve_request_model(
+    req: ChatCompletionRequest, settings: Settings, catalog: Optional[ModelCatalog]
+) -> str:
+    """``resolve_model`` against the live catalog, mapped to an OpenAI error."""
+    known = catalog.display_names() if catalog and catalog.loaded else None
+    fams = catalog.families() if catalog and catalog.loaded else None
+    try:
+        return resolve_model(
+            req.model, settings, effort=req.effort or settings.default_effort,
+            known_models=known, families=fams,
+        )
+    except UnknownModel as e:
+        raise OpenAIError(
+            f"model {str(e)!r} is not available on this Antigravity install; "
+            f"see GET /v1/models",
+            status_code=400, type="invalid_request_error", param="model",
+            code="model_not_found",
+        )
+
+
+def check_prompt_size(prompt: str, settings: Settings) -> int:
+    """Return the UTF-8 byte size; raise 400 when over the sanity cap."""
+    try:
+        return _check_prompt_size(prompt, settings)
+    except PromptTooLarge as e:
+        raise OpenAIError(
+            f"prompt is {e.nbytes} UTF-8 bytes; the server cap is {e.cap} "
+            "(AGI_MAX_PROMPT_BYTES). Shorten the conversation or let the server "
+            "resume it via the conversation cache.",
+            status_code=400, type="invalid_request_error", code="context_length_exceeded",
+        )
+
+
 @router.post("/v1/chat/completions")
 async def chat_completions(req: ChatCompletionRequest, request: Request):
     settings = get_settings()
-    model = resolve_model(req.model, settings, effort=req.effort or settings.default_effort)
+    model = resolve_request_model(req, settings, getattr(request.app.state, "model_catalog", None))
     try:
         workdir = settings.resolve_workdir(req.workdir)
     except ValueError as e:
@@ -87,13 +144,22 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
 
     cache: ConversationCache = request.app.state.conv_cache
 
-    # System prompt → managed agent (--agent <slug>); falls back to preamble
-    # injection when disabled or the plugin dir cannot be written. The slug is
-    # deterministic from the prompt, so cache-hit resumes recompute the same one.
+    # System prompt → managed agent (--agent <slug>). The agent also carries
+    # the plain-chat tools allowlist, so it is created even without a system
+    # message. Restrictive modes fail closed if the plugin cannot be written.
     convo, system = split_system(req.messages)
+    check_prompt_size(build_prompt(convo, system, inject_system=True), settings)
     agent = None
-    if system and settings.system_prompt_via_agent:
-        agent = await request.app.state.agent_plugin.ensure_agent(system)
+    if settings.system_prompt_via_agent or settings.plain_chat_tools != "all":
+        agent = await request.app.state.agent_plugin.ensure_agent(
+            system if settings.system_prompt_via_agent else None,
+            tools_mode=settings.plain_chat_tools,
+        )
+    if agent is None and settings.plain_chat_tools != "all":
+        raise OpenAIError(
+            "cannot install the required tool-restricted agent",
+            status_code=503, code="agent_unavailable",
+        )
 
     # ── conversation-cache hit: resume with only the newest user message ─────
     hit = cache.lookup(req.messages)
@@ -109,20 +175,12 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             convo = materialize_messages(convo, workdir)
         # No agent (mode off, or plugin dir unwritable) → automatic fallback:
         # the system message rides as an instruction preamble instead.
-        prompt = build_prompt(convo, system, inject_system=agent is None)
+        prompt = build_prompt(convo, system, inject_system=(agent is None or not settings.system_prompt_via_agent))
         conversation_id = None
 
     if not prompt.strip():
         raise OpenAIError("no user content in messages", status_code=400, param="messages")
-    if len(prompt) > settings.max_prompt_chars:
-        raise OpenAIError(
-            f"prompt is {len(prompt)} chars; the agy CLI accepts at most "
-            f"{settings.max_prompt_chars} (argv limit). Shorten the conversation "
-            "or let the server resume it via the conversation cache.",
-            status_code=400,
-            type="invalid_request_error",
-            code="context_length_exceeded",
-        )
+    check_prompt_size(prompt, settings)
 
     sess = AgySession(
         agy_bin=settings.agy_bin,
@@ -132,6 +190,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
         conversation_id=conversation_id,
         agent=agent,
         print_timeout_s=settings.request_timeout_s,
+        disable_slash_commands=settings.disable_slash_commands,
         timing_log=settings.timing_log,
         timing_label="autonomous",
     )
@@ -154,8 +213,15 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             media_type="text/event-stream",
             headers=_SSE_HEADERS,
         )
-    body = await _collect(sess, cache, req, cid, model, created, timeout, flatten,
-                          settings.timing_log, thinking)
+    try:
+        body = await _collect(sess, cache, req, cid, model, created, timeout, flatten,
+                              settings.timing_log, thinking, request,
+                              settings.disconnect_poll_s)
+    except ClientDisconnected:
+        logger.info("client disconnected mid-turn; agy subprocess terminated")
+        # Starlette discards the response body anyway; 499 mirrors nginx.
+        return JSONResponse(status_code=499, content=error_envelope(
+            "client closed request", type="client_disconnected"))
     return JSONResponse(content=body)
 
 
@@ -233,11 +299,31 @@ async def _stream(
         await sess.aclose()
 
 
+async def _next_event_or_disconnect(
+    sess: AgySession, request: Optional[Request], remaining: float, poll_s: float
+):
+    """``sess.next_event`` that also notices the client hanging up."""
+    if request is None or poll_s <= 0:
+        return await sess.next_event(timeout=remaining)
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + remaining
+    while True:
+        slice_ = min(poll_s, deadline - loop.time())
+        if slice_ <= 0:
+            return None
+        if await request.is_disconnected():
+            raise ClientDisconnected()
+        ev = await sess.next_event(timeout=slice_)
+        if ev is not None:
+            return ev
+
+
 async def _collect(
     sess: AgySession, cache: ConversationCache, req: ChatCompletionRequest,
     cid: str, model: str, created: int, timeout: float,
     flatten_tables: bool = True, timing: bool = False,
     thinking: TurnThinking | None = None,
+    request: Optional[Request] = None, disconnect_poll_s: float = 1.0,
 ) -> dict:
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout
@@ -251,7 +337,7 @@ async def _collect(
             remaining = deadline - loop.time()
             if remaining <= 0:
                 raise OpenAIError("upstream timeout", status_code=504, type="timeout_error")
-            ev = await sess.next_event(timeout=remaining)
+            ev = await _next_event_or_disconnect(sess, request, remaining, disconnect_poll_s)
             if thinking is not None:
                 if isinstance(ev, Init):
                     thinking.on_init(ev.conversation_id)
@@ -343,8 +429,22 @@ async def _handle_tools(
             media_type="text/event-stream",
             headers=_SSE_HEADERS,
         )
-    body = await _tool_collect(mgr, conv, cid, model, created, flatten, timing)
-    return JSONResponse(content=body)
+    task = asyncio.create_task(_tool_collect(mgr, conv, cid, model, created, flatten, timing))
+    try:
+        while not task.done():
+            if settings.disconnect_poll_s > 0 and await request.is_disconnected():
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+                await mgr._close(conv)
+                return JSONResponse(status_code=499, content=error_envelope("client closed request"))
+            await asyncio.wait({task}, timeout=max(0.05, settings.disconnect_poll_s))
+        return JSONResponse(content=task.result())
+    finally:
+        if not task.done():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
 
 
 async def _tool_stream(mgr, conv, cid, model, created, flatten_tables: bool = True,
@@ -387,6 +487,8 @@ async def _tool_stream(mgr, conv, cid, model, created, flatten_tables: bool = Tr
         yield DONE
     finally:
         timer.done(completion_tokens)
+        if conv.state == "running":
+            await mgr._close(conv)
 
 
 async def _tool_collect(mgr, conv, cid, model, created, flatten_tables: bool = True,

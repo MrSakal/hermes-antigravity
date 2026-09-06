@@ -4,7 +4,9 @@ import json
 import os
 import time
 
-from app.agent_config import AgentPluginManager, slug_for
+import pytest
+
+from app.agent_config import NEUTRAL_SYSTEM_PROMPT, AgentPluginManager, slug_for
 
 
 async def test_ensure_agent_creates_plugin_and_file(tmp_path):
@@ -17,7 +19,37 @@ async def test_ensure_agent_creates_plugin_and_file(tmp_path):
     body = (tmp_path / "hermes-bridge" / "agents" / f"{slug}.md").read_text()
     assert body.startswith("---\n")
     assert f"name: {slug}" in body
+    assert 'tools: "*"' in body
     assert "You are a pirate." in body
+
+
+async def test_tools_mode_is_an_allowlist_in_frontmatter(tmp_path):
+    mgr = AgentPluginManager(tmp_path / "p")
+    ro = await mgr.ensure_agent("prompt", tools_mode="readonly")
+    none = await mgr.ensure_agent("prompt", tools_mode="none")
+    full = await mgr.ensure_agent("prompt", tools_mode="all")
+    assert len({ro, none, full}) == 3  # distinct agents per mode
+    agents = tmp_path / "p" / "agents"
+    assert 'tools: ["view_file"]' in (agents / f"{ro}.md").read_text()
+    assert "tools: []" in (agents / f"{none}.md").read_text()
+    assert 'tools: "*"' in (agents / f"{full}.md").read_text()
+    # "all" keeps the legacy slug so existing agent files stay valid.
+    assert full == slug_for("prompt")
+
+
+async def test_no_system_prompt_still_yields_agent_for_allowlist(tmp_path):
+    mgr = AgentPluginManager(tmp_path / "p")
+    slug = await mgr.ensure_agent(None, tools_mode="readonly")
+    assert slug is not None
+    body = (tmp_path / "p" / "agents" / f"{slug}.md").read_text()
+    assert NEUTRAL_SYSTEM_PROMPT in body
+    assert 'tools: ["view_file"]' in body
+
+
+async def test_unknown_tools_mode_rejected(tmp_path):
+    mgr = AgentPluginManager(tmp_path / "p")
+    with pytest.raises(ValueError):
+        await mgr.ensure_agent("x", tools_mode="everything")
 
 
 async def test_same_prompt_same_slug_idempotent(tmp_path):

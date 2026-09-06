@@ -6,7 +6,7 @@ curl -sS "${BASE}/v1/chat/completions" \
   -H 'Content-Type: application/json' \
   -H 'Authorization: Bearer any-key-accepted' \
   -d '{
-    "model": "gemini-3.5-flash",
+    "model": "gemini-3.8-flash",
     "stream": false,
     "messages": [{"role": "user", "content": "Reply with exactly the word PONG."}]
   }' | python3 -m json.tool

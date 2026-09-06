@@ -10,7 +10,7 @@ import sys
 import httpx
 
 BASE = sys.argv[1] if len(sys.argv) > 1 else "http://127.0.0.1:8788"
-MODEL = "gemini-3.5-flash"
+MODEL = "gemini-3.8-flash"
 
 
 def test_nonstream() -> bool:

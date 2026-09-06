@@ -22,7 +22,7 @@ async def drain(sess: AgySession) -> list:
 def make_session(tmp_path, **kw) -> AgySession:
     defaults = dict(
         agy_bin="agy-unused",
-        model="Gemini 3.5 Flash (Medium)",
+        model="Gemini 3.7 Flash (Medium)",
         workdir=tmp_path,
         prompt="hello",
         print_timeout_s=30,
@@ -92,20 +92,47 @@ async def test_arg_construction(fake_agy, tmp_path):
     events = await drain(sess)
     await sess.aclose()
 
-    # fake_agy echoargs mode emits argv as an unparseable-for-us JSON line?
-    # No: it emits {"argv": [...]} which parse_line ignores (no "event") — so it
-    # lands in raw_tail; recover it from there.
+    # fake_agy echoargs mode emits {"argv": [...], "prompt": ...} which
+    # parse_line ignores (no "event") — so it lands in raw_tail.
     argv_line = next((l for l in sess.raw_tail if l.startswith('{"argv"')), None)
     assert argv_line is not None
-    argv = json.loads(argv_line)["argv"]
-    assert argv[:2] == ["-p", "the prompt"]
+    echoed = json.loads(argv_line)
+    argv = echoed["argv"]
+    # stdin transport: print mode with an EMPTY argv prompt, stream-json in.
+    assert argv[:4] == ["--print", "", "--input-format", "stream-json"]
+    assert "-p" not in argv
+    assert echoed["prompt"] == "the prompt"
     assert "--output-format" in argv and "stream-json" in argv
     assert "--dangerously-skip-permissions" in argv
+    assert "--disable-slash-commands" in argv
     assert "--print-timeout" in argv and "30s" in argv
-    assert "--model" in argv and "Gemini 3.5 Flash (Medium)" in argv
+    assert "--model" in argv and "Gemini 3.7 Flash (Medium)" in argv
     assert "--conversation" in argv and "prev-42" in argv
     assert "--add-dir" in argv
     assert "--agent" not in argv
+
+
+async def test_prompt_not_in_argv_survives_argv_limits(fake_agy, tmp_path):
+    """A prompt far beyond MAX_ARG_STRLEN (128 KiB) must reach agy intact
+    over stdin — the whole point of the stream-json transport."""
+    fake_agy("echoprompt")
+    big = "ő" * 300_000 + "THE_END!"  # 600 KB+ of UTF-8
+    sess = make_session(tmp_path, prompt=big)
+    await sess.start()
+    events = await drain(sess)
+    await sess.aclose()
+    done = [e for e in events if isinstance(e, TurnDone)]
+    assert done and done[0].response_text == f"len={len(big)};tail=THE_END!"
+
+
+async def test_slash_commands_can_be_enabled(fake_agy, tmp_path):
+    fake_agy("echoargs")
+    sess = make_session(tmp_path, disable_slash_commands=False)
+    await sess.start()
+    await drain(sess)
+    await sess.aclose()
+    argv = json.loads(next(l for l in sess.raw_tail if l.startswith('{"argv"')))["argv"]
+    assert "--disable-slash-commands" not in argv
 
 
 async def test_arg_construction_with_agent(fake_agy, tmp_path):

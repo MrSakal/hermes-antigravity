@@ -16,7 +16,7 @@ from fastapi import APIRouter, Request, Response, status
 from pydantic import BaseModel
 
 from app.openai_models import ModelList
-from app.routes.models import list_models
+from app.routes.models import list_models, model_ids
 
 router = APIRouter()
 
@@ -31,10 +31,9 @@ def _app_version() -> str:
     return "0.1.0"
 
 
-async def _model_ids() -> list[str]:
+async def _model_ids(request: Request) -> list[str]:
     """The advertised model ids, sourced from the OpenAI ``/v1/models`` handler."""
-    models: ModelList = await list_models()
-    return [card.id for card in models.data]
+    return model_ids(request)
 
 
 # Static "details" block reused by /api/tags and /api/show. Values are nominal —
@@ -53,8 +52,8 @@ _DETAILS = {
 
 
 @router.get("/api/tags")
-async def api_tags() -> dict:
-    ids = await _model_ids()
+async def api_tags(request: Request) -> dict:
+    ids = await _model_ids(request)
     return {
         "models": [
             {
@@ -80,9 +79,9 @@ class ShowRequest(BaseModel):
 
 
 @router.post("/api/show")
-async def api_show(body: ShowRequest, response: Response) -> dict:
+async def api_show(body: ShowRequest, request: Request, response: Response) -> dict:
     requested = body.model or body.name
-    ids = await _model_ids()
+    ids = await _model_ids(request)
     if not requested or requested not in ids:
         response.status_code = status.HTTP_404_NOT_FOUND
         return {"error": f"model {requested!r} not found"}
@@ -144,5 +143,5 @@ async def props(request: Request) -> dict:
 
 
 @router.get("/api/v1/models", response_model=ModelList)
-async def api_v1_models() -> ModelList:
-    return await list_models()
+async def api_v1_models(request: Request) -> ModelList:
+    return await list_models(request)

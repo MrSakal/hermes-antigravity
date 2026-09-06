@@ -9,7 +9,7 @@ Google-account sign-in shared with the Antigravity IDE (no API key, no per-token
 billing).
 
 Under the hood it drives `agy` as one subprocess per turn over its
-`stream-json` output protocol; conversation history lives server-side in agy and
+stdin/stdout `stream-json` protocol (requires agy >= 1.1.15); conversation history lives server-side in agy and
 follow-up turns resume it via `--conversation <id>`.
 
 ## What it does
@@ -22,11 +22,12 @@ follow-up turns resume it via `--conversation <id>`.
   client runs the tool and sends the result back, and the same agy subprocess
   resumes — the whole multi-step tool loop is one conversation kept alive
   across the continuations.
-- **Antigravity's own built-in tools** (file ops, shell, browser automation,
-  subagents, …) run internally the whole time.
+- **Builtin-tool restrictions:** plain chat defaults to a `view_file` allowlist
+  (including image viewing). Tool-passthrough turns still require the full builtin
+  set for dynamic MCP dispatch. This is not an OS or filesystem sandbox.
 - **Conversation cache:** a follow-up request whose history matches a previous
   turn resumes the stored agy conversation and sends only the newest user
-  message — cheaper, and immune to the prompt-length cap (see below).
+  message — cheaper and smaller on the upstream wire. The request byte cap still applies.
 - **Real system prompts via managed agents** (default on): agy has no
   system-prompt flag, but it does support custom agents. The request's system
   message is materialized as an agent definition inside a server-managed plugin
@@ -36,9 +37,9 @@ follow-up turns resume it via `--conversation <id>`.
   across conversation resumes. (Antigravity's base identity/environment context
   remains present underneath — the equivalent of hermes-claude's
   `--append-system-prompt` mode; a full "bare model" replacement is not
-  possible, see the deviations note below.) Fallback (when disabled or the
-  plugin dir is unwritable): the system message is injected as an instruction
-  preamble at the top of the first turn.
+  possible, see the deviations note below.) When disabled the system message
+  uses a prompt preamble. Restrictive tool modes still require a neutral agent;
+  an unwritable plugin returns 503 rather than silently granting full tools.
 - **Reasoning passthrough** (always on): the model's thinking surfaces as
   OpenAI-style `reasoning_content` — a delta chunk right before the answer
   text (streaming) or `message.reasoning_content` (non-streaming), so hermes'
@@ -47,7 +48,7 @@ follow-up turns resume it via `--conversation <id>`.
   against 1.1.4). Blocks arrive whole per model step — there is no incremental
   thinking stream. If the file/format ever changes, responses simply carry no
   reasoning; nothing breaks.
-- **Image input**: agy has no image flag and no stdin channel, but its builtin
+- **Image input**: image attachments use local files; agy's builtin
   file tools can view local images. Data-URL images in OpenAI `image_url`
   content parts are written to `<workdir>/attachments/` (content-addressed,
   deduplicated) and the prompt references the file so the model looks at it.
@@ -59,7 +60,7 @@ follow-up turns resume it via `--conversation <id>`.
 
 ## Requirements
 
-- The `agy` CLI installed and signed in (it shares auth with the Antigravity
+- The `agy` CLI **>= 1.1.15** installed and signed in (it shares auth with the Antigravity
   IDE/app). Windows: `irm https://antigravity.google/cli/install.ps1 | iex`;
   other platforms: see the [install docs](https://antigravity.google/docs/cli-install).
 - Python 3.11+.
@@ -91,91 +92,9 @@ file). See the full list below.
 Copy `.env.example` to `.env` and edit, or export the vars directly. Every field
 is overridable via `AGI_<FIELD>`.
 
-```bash
-# antigravity-interface configuration (env prefix AGI_). Copy to .env or export.
-
-# ── HTTP server ──────────────────────────────────────────────────────────────
-AGI_HOST=127.0.0.1
-AGI_PORT=8788
-
-# ── Auth ─────────────────────────────────────────────────────────────────────
-# Optional bearer token gating every /v1 request. Safe to leave UNSET only on a
-# loopback bind. The server REFUSES to start on a non-loopback host unless this
-# is set — it drives agy with --dangerously-skip-permissions, so an open bind
-# with no key is remote code execution for anyone who can reach the port.
-# AGI_API_KEY=choose-a-long-random-secret
-
-# ── Antigravity CLI ──────────────────────────────────────────────────────────
-AGI_AGY_BIN=agy
-AGI_DEFAULT_MODEL=Gemini 3.5 Flash (Medium)
-# AGI_DEFAULT_EFFORT=high
-
-# ── Prompt handling ──────────────────────────────────────────────────────────
-# agy takes the prompt as an argv argument (stdin is not supported); Windows
-# caps a command line at ~32,767 chars.
-AGI_MAX_PROMPT_CHARS=28000
-
-# ── System prompt via managed agent ──────────────────────────────────────────
-# Deliver the request's system message as a REAL system prompt: it is written
-# as an agent definition (agents/hermes-<hash>.md) into a server-managed plugin
-# and agy is spawned with --agent <slug>. The agent body overrides the CLI's
-# built-in persona and stays in effect across conversation resumes. When false
-# (or the plugin dir cannot be written) the system message automatically falls
-# back to an instruction preamble at the top of the first turn.
-AGI_SYSTEM_PROMPT_VIA_AGENT=true
-# AGI_AGENT_PLUGIN_PATH=~/.gemini/config/plugins/hermes-bridge
-AGI_AGENT_CACHE_MAX=64
-
-# ── Reasoning / thinking passthrough ─────────────────────────────────────────
-# Always on (no toggle): the model's thinking surfaces as `reasoning_content`,
-# read best-effort from agy's internal brain transcript. Override the brain
-# location only for nonstandard installs.
-# AGI_AGY_BRAIN_PATH=~/.gemini/antigravity-cli/brain
-
-# ── Image input ──────────────────────────────────────────────────────────────
-# Write data-URL images from OpenAI image_url content parts to
-# <workdir>/attachments/ and reference the file in the prompt; agy's builtin
-# file tools let the (multimodal) model view them.
-AGI_IMAGE_INPUT=true
-
-# ── Conversation continuity ──────────────────────────────────────────────────
-# History-prefix -> agy conversation id cache: follow-ups send only the newest
-# user message with --conversation <id> instead of re-folding the transcript.
-AGI_CONVERSATION_CACHE_MAX=256
-AGI_CONVERSATION_CACHE_TTL_S=3600
-
-# ── MCP config registration (tool calling) ──────────────────────────────────
-# Tool-turn conversations register per-conversation server entries ("hermes",
-# "hermes2", ...) in the shared Antigravity MCP config — the ONLY file agy
-# honors. Entries are added before spawn and removed at close; foreign entries
-# are never touched.
-AGI_MANAGE_MCP_CONFIG=true
-# AGI_MCP_CONFIG_PATH=~/.gemini/config/mcp_config.json
-
-# ── Output formatting ────────────────────────────────────────────────────────
-# Rewrite Markdown pipe tables to fenced monospace ASCII so they render in
-# clients that don't support Markdown tables (e.g. Discord).
-AGI_FLATTEN_MARKDOWN_TABLES=true
-
-# ── Workspace (agy's --add-dir + cwd) ────────────────────────────────────────
-# Per-request `workdir` overrides must resolve under one of
-# AGI_ALLOWED_WORKDIR_ROOTS (a JSON list); empty => only the default is allowed.
-AGI_DEFAULT_WORKDIR=~/agi-workspace
-# AGI_ALLOWED_WORKDIR_ROOTS=["C:\\Projects"]
-
-# ── Lifecycle (seconds) ──────────────────────────────────────────────────────
-AGI_REQUEST_TIMEOUT_S=600
-AGI_SUSPENDED_TTL_S=300
-AGI_IDLE_SESSION_TTL_S=900
-AGI_GC_INTERVAL_S=30
-
-# ── Logging ──────────────────────────────────────────────────────────────────
-AGI_LOG_LEVEL=INFO
-# Emit per-turn latency metrics (spawn_ms / ttft_ms / total_ms / tok_per_s) to
-# the "agi.timing" logger at INFO. Off by default so normal operation pays
-# nothing; scripts/bench.py turns it on for the throwaway benchmark instance.
-AGI_TIMING_LOG=false
-```
+The authoritative, commented template is [`.env.example`](.env.example).
+For shell startup use `uvicorn --env-file .env`; `Settings` does not load `.env`
+automatically. The systemd example below uses `EnvironmentFile`.
 
 ### Config reference
 
@@ -185,10 +104,16 @@ AGI_TIMING_LOG=false
 | `AGI_PORT` | `8788` | Bind port. Also used to build the per-conversation MCP callback URL. |
 | `AGI_API_KEY` | _(unset)_ | Bearer token required on every `/v1` request when set. Mandatory for a non-loopback bind. |
 | `AGI_AGY_BIN` | `agy` | Path to the `agy` CLI. |
-| `AGI_DEFAULT_MODEL` | `Gemini 3.5 Flash (Medium)` | Model used when the request names none / an unknown one (exact `agy models` display name). |
+| `AGI_DEFAULT_MODEL` | `Gemini 3.8 Flash (Medium)` | Model used when the request names none (display name or agy slug). Unknown requests only fall back when strict mode is disabled. |
 | `AGI_DEFAULT_EFFORT` | _(unset)_ | Effort used to pick a model variant (`low`/`medium`/`high`). |
-| `AGI_MAX_PROMPT_CHARS` | `28000` | Fresh-fold prompt cap (agy takes the prompt via argv; Windows limit ~32,767). |
-| `AGI_SYSTEM_PROMPT_VIA_AGENT` | `true` | Deliver the system message as a generated agent definition (`--agent <slug>`), overriding the CLI persona. Off/unwritable → automatic prompt-preamble fallback. |
+| `AGI_MAX_PROMPT_BYTES` | `4000000` | UTF-8 prompt sanity cap; oversized requests return 400 `context_length_exceeded`. Replaces `AGI_MAX_PROMPT_CHARS`; no disk prompt handoff. |
+| `AGI_DISABLE_SLASH_COMMANDS` | `true` | Prevent user content from invoking CLI slash commands. |
+| `AGI_STRICT_MODEL` | `true` | Reject unknown models with 400 `model_not_found`; false retains legacy default fallback. |
+| `AGI_MODEL_CATALOG_REFRESH_S` | `3600` | Query `agy models` at startup and periodically; 0 disables periodic refresh. Failed refresh retains the last good catalog, with static fallback before the first successful load. |
+| `AGI_PLAIN_CHAT_TOOLS` | `readonly` | Agent builtin allowlist: `readonly` = view_file, `none` = no tools, `all` = unrestricted. |
+| `AGI_TOOL_TURN_TOOLS` | `all` | Dynamic MCP dispatch requires the full builtin set on current agy. |
+| `AGI_DISCONNECT_POLL_S` | `1.0` | Nonstream disconnect polling interval for plain and tool turns; 0 disables polling. Streaming cancellation also reaps the process. |
+| `AGI_SYSTEM_PROMPT_VIA_AGENT` | `true` | Deliver the system message as a generated agent definition (`--agent <slug>`), overriding the CLI persona. Off → prompt preamble; readonly/none still require an agent and fail closed if it cannot be created. |
 | `AGI_AGENT_PLUGIN_PATH` | `~/.gemini/config/plugins/hermes-bridge` | Managed agent-plugin directory override. |
 | `AGI_AGENT_CACHE_MAX` | `64` | Max generated agent files kept (LRU by mtime). |
 | `AGI_AGY_BRAIN_PATH` | `~/.gemini/antigravity-cli/brain` | Brain (conversation transcript) directory override — the source of the always-on `reasoning_content` passthrough. |
@@ -255,7 +180,7 @@ is configured:
 ```bash
 curl http://127.0.0.1:8788/v1/chat/completions \
   -H 'Content-Type: application/json' \
-  -d '{"model":"gemini-3.5-flash","messages":[{"role":"user","content":"hello"}]}'
+  -d '{"model":"gemini-3.8-flash","messages":[{"role":"user","content":"hello"}]}'
 ```
 
 With `AGI_API_KEY` set, add the bearer header:
@@ -264,7 +189,7 @@ With `AGI_API_KEY` set, add the bearer header:
 curl http://127.0.0.1:8788/v1/chat/completions \
   -H 'Content-Type: application/json' \
   -H "Authorization: Bearer $AGI_API_KEY" \
-  -d '{"model":"gemini-3.5-flash","messages":[{"role":"user","content":"hello"}]}'
+  -d '{"model":"gemini-3.8-flash","messages":[{"role":"user","content":"hello"}]}'
 ```
 
 From **hermes**, add a provider in `~/.hermes/config.yaml` and select it:
@@ -276,24 +201,25 @@ providers:
     base_url: http://127.0.0.1:8788/v1
     api_key: any-string-accepted   # or your AGI_API_KEY if one is set
     api_mode: chat_completions
-    default_model: gemini-3.5-flash
-    models: [gemini-3.5-flash, gemini-3.1-pro, claude-sonnet-4.6, claude-opus-4.6, gpt-oss-120b]
+    default_model: gemini-3.8-flash
+    models: [gemini-3.8-flash, gemini-3.1-pro, claude-sonnet-4.6, claude-opus-4.6, gpt-oss-120b]
 ```
 
-Models: `agy --model` accepts **exact display names** only; the server maps
+Models are discovered from **`agy models`**. The server maps
 OpenAI-friendly slugs onto them, with `effort` (or a `-low/-medium/-high` slug
 suffix) picking the variant:
 
 | Slug | agy model |
 |------|-----------|
-| `gemini-3.5-flash` (+`-low/-high`, or `effort`) | `Gemini 3.5 Flash (Low/Medium/High)` |
+| `gemini-3.8-flash` (+`-low/-high`, or `effort`) | `Gemini 3.8 Flash (Low/Medium/High)` |
 | `gemini-3.1-pro` (+`-high`, or `effort`) | `Gemini 3.1 Pro (Low/High)` |
 | `claude-sonnet-4.6` / `sonnet` | `Claude Sonnet 4.6 (Thinking)` |
 | `claude-opus-4.6` / `opus` | `Claude Opus 4.6 (Thinking)` |
 | `gpt-oss-120b` | `GPT-OSS 120B (Medium)` |
 
-Unknown ids fall back to `AGI_DEFAULT_MODEL`. All of them bill through the same
-Google subscription the Antigravity IDE uses.
+Unknown IDs return **400 `model_not_found`** by default. Set `AGI_STRICT_MODEL=false`
+only when legacy default-model fallback is intentional. `/v1/models` is the live
+source of truth; the table above illustrates aliases, not a frozen catalog.
 
 ## The shared MCP config
 
@@ -317,23 +243,29 @@ absorbs the cold start, so a per-turn subprocess spawn measures ~30–50 ms
 
 For system-prompt delivery the server owns one plugin directory,
 `~/.gemini/config/plugins/hermes-bridge/` (override with
-`AGI_AGENT_PLUGIN_PATH`). Each distinct system prompt becomes
+`AGI_AGENT_PLUGIN_PATH`). Each distinct (system prompt, tool mode) pair becomes
 `agents/hermes-<sha1[:12]>.md` — created on first use, discovered by agy at
 conversation start with no install step, reused on repeat requests and
 conversation resumes (the slug is deterministic), and pruned LRU beyond
 `AGI_AGENT_CACHE_MAX`. Only files matching the `hermes-<hash>.md` pattern are
 ever pruned; other plugins and hand-written agents are never touched. Set
-`AGI_SYSTEM_PROMPT_VIA_AGENT=false` to forbid touching the plugin dir — the
-system message then falls back to the prompt-preamble injection.
+`AGI_SYSTEM_PROMPT_VIA_AGENT=false` to use a system-message preamble. A neutral
+agent is still installed for readonly/none tool restrictions. Only explicit
+`AGI_PLAIN_CHAT_TOOLS=all` permits agent-free fallback; plugin write failures in
+restricted modes return **503 `agent_unavailable`**.
 
-Limits of the agent mechanism (verified against agy 1.1.4) — this is why
-hermes-claude's full `bare_model_mode` cannot be mapped:
+Limits of the agent mechanism (tool behavior checked against agy 1.1.27):
 
-- The frontmatter `tools:` field is an **additive grant**, not an allowlist: it
-  is required to expose `call_mcp_tool` (hence the generated `tools: "*"`),
-  but listing a subset does NOT strip the builtin tools — an agent restricted
-  to `view_file` still calls `list_dir` freely. There is no `--tools ""`
-  equivalent.
+- `tools: ["view_file"]` restricts builtin access (agy may also expose its internal
+  `manage_task` helper). `tools: []` disables it; `tools: "*"` grants all builtins.
+  Explicit `call_mcp_tool` allowlisting fails on this CLI, so tool turns retain
+  full permissions. The CLI's `--sandbox` flag did not enforce isolation in live
+  probes and is deliberately **not** used as a security boundary.
+- Readonly does **not** mean confidential: `view_file` can read files accessible
+  to the service user, not merely attachments. Use `none` for text-only tasks that
+  must not read local files, or isolate the service account/filesystem. Image
+  attachments and CLI-owned conversation transcripts remain on disk; only the
+  obsolete `.prompt-payloads` handoff has been removed.
 - The base Antigravity system context (identity, environment/workspace
   details, date) stays underneath the agent prompt; there is no
   `--exclude-dynamic-system-prompt-sections` equivalent. The agent persona
@@ -386,6 +318,7 @@ Live scripts (need the `agy` CLI signed in; the e2e ones also need a running
 server on `:8788`):
 
 ```bash
+.venv/bin/python tests/scripts/e2e_live.py --port 8799 # local live acceptance suite
 .venv/bin/python tests/scripts/e2e_autonomous.py # live: plain chat, stream + non-stream
 .venv/bin/python tests/scripts/e2e_tool.py       # live: full tool loop
 .venv/bin/python tests/scripts/smoke_session.py  # live: drives agy directly, 2 turns + resume
@@ -408,10 +341,23 @@ to JSON:
 It sets `AGI_PORT` (not just `--port`) so the per-conversation MCP callback URL
 the spawned `agy` dials self-matches the throwaway port.
 
+## Native prompt transport
+
+`agy --print "" --input-format stream-json --output-format stream-json` receives
+one UTF-8 NDJSON event on stdin, followed by EOF:
+
+```json
+{"event":"user","message":{"role":"user","content":"the complete prompt"}}
+```
+
+The empty print argument is mandatory: `-p --input-format` makes agy consume
+`--input-format` as the prompt. Prompts never enter argv or `.prompt-payloads`.
+The byte cap remains a sanity guard, not a guarantee of model context capacity.
+
 ## How it works
 
 ```
-OpenAI client ──HTTP /v1──▶ agi-server ──argv + stream-json (stdout)──▶ agy CLI
+OpenAI client ──HTTP /v1──▶ agi-server ──NDJSON stdin / stdout──▶ agy CLI
        ▲                        │                                          │
        └──── tool_calls ────────┤          call_mcp_tool(hermesN,…)        │
        │                        │◀──────── in-process MCP bridge ◀─────────┘
@@ -432,3 +378,6 @@ OpenAI client ──HTTP /v1──▶ agi-server ──argv + stream-json (stdou
   `completion_tokens_details.reasoning_tokens`.
 - A background GC reaps suspended-too-long and idle conversations (and their
   config entries).
+- Disconnect teardown uses pure ASGI auth middleware and shielded cancellation
+  cleanup: TERM, then KILL after 5 seconds if necessary. Non-streaming tool and
+  plain-chat requests poll the connection; streaming responses close on cancellation.

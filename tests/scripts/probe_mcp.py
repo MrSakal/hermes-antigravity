@@ -42,7 +42,7 @@ from app.mcp_config import McpConfigManager
 
 PORT = int(os.environ.get("PROBE_PORT", "8799"))
 CONV_ID = "probeconv"
-MODEL = "Gemini 3.5 Flash (Medium)"
+MODEL = "Gemini 3.8 Flash (Medium)"
 WORKDIR = Path(tempfile.gettempdir()) / "agi_probe_ws"
 
 # Shared probe state

@@ -62,7 +62,7 @@ async def collect_turn(mgr, conv):
 async def test_full_tool_cycle(mgr, fake_agy, tmp_path):
     fake_agy("hang")
     req = make_request()
-    conv = await mgr.create(req, model="Gemini 3.5 Flash (Medium)",
+    conv = await mgr.create(req, model="Gemini 3.7 Flash (Medium)",
                             workdir=mgr.settings.default_workdir)
 
     # Config entry exists while the conversation lives.

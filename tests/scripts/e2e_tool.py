@@ -41,7 +41,7 @@ def post(base: str, payload: dict) -> dict:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--base", default="http://127.0.0.1:8788")
-    ap.add_argument("--model", default="gemini-3.5-flash")
+    ap.add_argument("--model", default="gemini-3.8-flash")
     args = ap.parse_args()
 
     messages = [

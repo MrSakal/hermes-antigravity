@@ -27,6 +27,7 @@ simultaneously and treats a PendingCall arrival as the suspend trigger.
 from __future__ import annotations
 
 import asyncio
+
 import logging
 import time
 from collections.abc import AsyncIterator
@@ -34,9 +35,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, Union
 
+import anyio
+
 from app.agent_config import AgentPluginManager
 from app.agy_session import STREAM_CLOSED, AgySession
-from app.config import Settings
+from app.config import PromptTooLarge, Settings, check_prompt_size
+from app.errors import OpenAIError
 from app.events import Error, Init, TextDelta, ToolStep, TurnDone
 from app.mcp_bridge import ConversationBridge, McpBridge, PendingCall
 from app.mcp_config import McpConfigManager
@@ -178,14 +182,35 @@ class ConversationManager:
         workdir: Path,
     ) -> Conversation:
         convo, system = split_system(req.messages)
+        self._check_size(build_prompt(convo, system, inject_system=True))
         agent = None
-        if system and self.settings.system_prompt_via_agent and self.agents is not None:
-            agent = await self.agents.ensure_agent(system)
+        if self.settings.system_prompt_via_agent and self.agents is not None:
+            # Tool turns need call_mcp_tool, which only `tools: "*"` grants
+            # (see agent_config) — hence tool_turn_tools, not plain_chat_tools.
+            agent = await self.agents.ensure_agent(
+                system, tools_mode=self.settings.tool_turn_tools
+            )
         if self.settings.image_input:
             convo = materialize_messages(convo, workdir)
         # No agent (mode off, or plugin dir unwritable) → automatic fallback:
         # the system message rides as an instruction preamble instead.
         content = build_prompt(convo, system, inject_system=agent is None)
+        if not content.strip():
+            raise OpenAIError("no user content in messages", status_code=400, param="messages")
+
+        # Nudge the model toward its slot: the schema cache the CLI injects
+        # names the server, but an explicit hint removes ambiguity. Built before
+        # the slot is allocated so a size rejection leaves no side effects; the
+        # slot name is a short token, so the cap is checked against the body.
+        tool_names = ", ".join(t.function.name for t in (req.tools or []))
+        try:
+            check_prompt_size(content, self.settings)
+        except PromptTooLarge as e:
+            raise OpenAIError(
+                f"prompt is {e.nbytes} UTF-8 bytes; the server cap is {e.cap} "
+                "(AGI_MAX_PROMPT_BYTES). Shorten the conversation.",
+                status_code=400, type="invalid_request_error", code="context_length_exceeded",
+            )
 
         async with self._lock:
             conv_id = self._next_conv_id()
@@ -193,9 +218,6 @@ class ConversationManager:
         self.mcp.register(bridge)
         slot = await self.mcp_config.add_conversation(conv_id, self._mcp_url(conv_id))
 
-        # Nudge the model toward its slot: the schema cache the CLI injects
-        # names the server, but an explicit hint removes ambiguity.
-        tool_names = ", ".join(t.function.name for t in (req.tools or []))
         hint = (
             f"\n\n[External functions are available on the MCP server "
             f"'{slot}' via the call_mcp_tool tool: {tool_names}. Use them when needed.]"
@@ -211,6 +233,7 @@ class ConversationManager:
             # The proc must survive suspensions (blocked in our MCP call while
             # hermes runs the tool), so its own ceiling exceeds one request's.
             print_timeout_s=self.settings.request_timeout_s + self.settings.suspended_ttl_s,
+            disable_slash_commands=self.settings.disable_slash_commands,
             timing_log=self.settings.timing_log,
             timing_label="tool",
         )
@@ -232,8 +255,15 @@ class ConversationManager:
 
     # ── resume (continuation) ─────────────────────────────────────────────—
 
+    def _check_size(self, content: str) -> None:
+        try:
+            check_prompt_size(content, self.settings)
+        except PromptTooLarge as exc:
+            raise OpenAIError(str(exc), status_code=400, code="context_length_exceeded") from exc
+
     async def resume(self, req: ChatCompletionRequest) -> Conversation:
         tool_msgs = self._trailing_tool_messages(req)
+        self._check_size("\n".join(message_text(message) for message in tool_msgs))
         if not tool_msgs:
             raise ExpiredContinuation("no trailing tool results in continuation request")
         ids = [m.tool_call_id for m in tool_msgs if m.tool_call_id]
@@ -347,11 +377,16 @@ class ConversationManager:
         """Race the stdout event queue against the bridge's incoming calls."""
         ev_task = asyncio.create_task(conv.session.next_event(timeout=timeout))
         call_task = asyncio.create_task(conv.bridge.next_incoming(timeout=timeout))
-        done, pending = await asyncio.wait(
-            {ev_task, call_task}, return_when=asyncio.FIRST_COMPLETED
-        )
-        for t in pending:
-            t.cancel()
+        try:
+            done, pending = await asyncio.wait(
+                {ev_task, call_task}, return_when=asyncio.FIRST_COMPLETED
+            )
+        finally:
+            for task in (ev_task, call_task):
+                if not task.done():
+                    task.cancel()
+            with anyio.CancelScope(shield=True):
+                await asyncio.gather(ev_task, call_task, return_exceptions=True)
         # Prefer a PendingCall when both completed together.
         if call_task in done:
             call = call_task.result()
@@ -369,6 +404,10 @@ class ConversationManager:
     # ── teardown ──────────────────────────────────────────────────────────—
 
     async def _close(self, conv: Conversation) -> None:
+        with anyio.CancelScope(shield=True):
+            await self._close_impl(conv)
+
+    async def _close_impl(self, conv: Conversation) -> None:
         if conv.state == CLOSED:
             return
         conv.state = CLOSED
@@ -379,8 +418,10 @@ class ConversationManager:
             for tid in stale:
                 self._pending_index.pop(tid, None)
         self.mcp.unregister(conv.conv_id)
-        await self.mcp_config.remove_conversation(conv.slot)
-        await conv.session.aclose()
+        try:
+            await self.mcp_config.remove_conversation(conv.slot)
+        finally:
+            await conv.session.aclose()
         logger.info("conv=%s closed", conv.conv_id)
 
     async def close_all(self) -> None:

@@ -20,12 +20,13 @@ from collections.abc import AsyncIterator
 from fastapi import FastAPI, Request
 
 from app.agent_config import AgentPluginManager
-from app.config import get_settings
+from app.config import KNOWN_MODELS, get_settings
 from app.convcache import ConversationCache
 from app.conversation import ConversationManager
 from app.errors import OpenAIError
 from app.mcp_bridge import McpBridge
 from app.mcp_config import McpConfigManager
+from app.model_catalog import ModelCatalog
 from app.routes import chat, compat, health, models
 
 logger = logging.getLogger("agi")
@@ -42,6 +43,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     logger.info("default model=%s workdir=%s", settings.default_model, settings.default_workdir)
 
     mcp: McpBridge = app.state.mcp
+    catalog: ModelCatalog = app.state.model_catalog
+    # Load the live model list before serving; failures keep the static table.
+    if await catalog.refresh():
+        logger.info("model catalog loaded from `agy models` (%d models)", len(catalog.entries))
+    else:
+        logger.warning("model catalog: using static fallback table (%d models)", len(KNOWN_MODELS))
+    catalog_task = None
+    if settings.model_catalog_refresh_s > 0:
+        catalog_task = asyncio.create_task(catalog.refresh_loop(), name="agi-model-catalog")
     async with mcp.lifespan():
         manager: ConversationManager | None = app.state.conv_manager
         gc_task = None
@@ -51,10 +61,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         try:
             yield
         finally:
-            if gc_task is not None:
-                gc_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await gc_task
+            for task in (gc_task, catalog_task):
+                if task is not None:
+                    task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await task
             if manager is not None:
                 await manager.close_all()
                 await manager.mcp_config.remove_all()
@@ -84,6 +95,9 @@ def create_app() -> FastAPI:
         max_entries=settings.conversation_cache_max,
         ttl_s=settings.conversation_cache_ttl_s,
     )
+    app.state.model_catalog = ModelCatalog(
+        settings.agy_bin, refresh_interval_s=settings.model_catalog_refresh_s
+    )
     agent_plugin = AgentPluginManager(
         settings.agent_plugin_path, max_agents=settings.agent_cache_max
     )
@@ -100,24 +114,6 @@ def create_app() -> FastAPI:
     async def _openai_error_handler(_: Request, exc: OpenAIError):  # type: ignore[unused-ignore]
         return exc.json_response()
 
-    @app.middleware("http")
-    async def _auth(request: Request, call_next):
-        # When an api_key is configured, every /v1 request must carry a matching
-        # bearer token. The MCP mount is intentionally exempt: it is reached only
-        # by the local agy subprocess over loopback and carries no token.
-        key = settings.api_key
-        if key and request.url.path.startswith("/v1"):
-            header = request.headers.get("authorization", "")
-            token = header[7:] if header[:7].lower() == "bearer " else ""
-            if not hmac.compare_digest(token, key):
-                return OpenAIError(
-                    "missing or invalid api key",
-                    status_code=401,
-                    type="invalid_request_error",
-                    code="invalid_api_key",
-                ).json_response()
-        return await call_next(request)
-
     app.include_router(health.router)
     app.include_router(models.router)
     app.include_router(chat.router)
@@ -125,7 +121,44 @@ def create_app() -> FastAPI:
 
     # Mount the in-process MCP server; the dispatcher reads conv_id from the path.
     app.mount("/mcp", mcp.asgi_app())
+
+    # Bearer auth as a PURE ASGI middleware (not @app.middleware("http") /
+    # BaseHTTPMiddleware): the Starlette base class wraps `receive` in a task
+    # group, which makes Request.is_disconnected() / a receive()-based
+    # disconnect watch downstream always see "still connected". The MCP mount
+    # is intentionally exempt — it is reached only by the local agy subprocess
+    # over loopback and carries no token.
+    app.add_middleware(_BearerAuth, api_key=settings.api_key)
     return app
+
+
+class _BearerAuth:
+    def __init__(self, app, api_key: str | None) -> None:
+        self.app = app
+        self.api_key = api_key
+
+    async def __call__(self, scope, receive, send) -> None:
+        if (
+            scope["type"] == "http"
+            and self.api_key
+            and (scope.get("path") or "").startswith("/v1")
+        ):
+            header = ""
+            for k, v in scope.get("headers") or ():
+                if k == b"authorization":
+                    header = v.decode("latin-1")
+                    break
+            token = header[7:] if header[:7].lower() == "bearer " else ""
+            if not hmac.compare_digest(token, self.api_key):
+                response = OpenAIError(
+                    "missing or invalid api key",
+                    status_code=401,
+                    type="invalid_request_error",
+                    code="invalid_api_key",
+                ).json_response()
+                await response(scope, receive, send)
+                return
+        await self.app(scope, receive, send)
 
 
 app = create_app()

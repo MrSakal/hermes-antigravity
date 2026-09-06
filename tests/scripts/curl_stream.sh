@@ -6,7 +6,7 @@ curl -sS -N "${BASE}/v1/chat/completions" \
   -H 'Content-Type: application/json' \
   -H 'Authorization: Bearer any-key-accepted' \
   -d '{
-    "model": "gemini-3.5-flash",
+    "model": "gemini-3.8-flash",
     "stream": true,
     "messages": [{"role": "user", "content": "Count from 1 to 5, one number per line."}]
   }'
