@@ -31,6 +31,7 @@ from app.model_catalog import ModelCatalog
 from app.resources import Admission, AttachmentStore, Metrics
 from app.request_guard import RequestGuard
 from app.routes import chat, compat, health, models
+from app.warmpool import WarmPool
 
 logger = logging.getLogger("agi")
 
@@ -56,6 +57,8 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     attachment_task = asyncio.create_task(app.state.attachments.gc_loop(), name="agi-attachments")
     if settings.model_catalog_refresh_s > 0:
         catalog_task = asyncio.create_task(catalog.refresh_loop(), name="agi-model-catalog")
+    pool: WarmPool = app.state.warm_pool
+    pool_task = asyncio.create_task(_pool_gc_loop(pool, settings.gc_interval_s), name="agi-warmpool-gc") if pool.enabled else None
     async with mcp.lifespan():
         manager: ConversationManager | None = app.state.conv_manager
         gc_task = None
@@ -65,15 +68,22 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         try:
             yield
         finally:
-            for task in (gc_task, catalog_task, attachment_task):
+            for task in (gc_task, catalog_task, attachment_task, pool_task):
                 if task is not None:
                     task.cancel()
                     with contextlib.suppress(asyncio.CancelledError):
                         await task
+            await pool.stop()
             if manager is not None:
                 await manager.close_all()
                 await manager.mcp_config.remove_all()
             logger.info("antigravity-interface shutting down")
+
+
+async def _pool_gc_loop(pool: WarmPool, interval_s: int) -> None:
+    while True:
+        await asyncio.sleep(max(1, interval_s))
+        await pool.gc()
 
 
 def create_app() -> FastAPI:
@@ -98,6 +108,8 @@ def create_app() -> FastAPI:
     app.state.admission = Admission(settings.max_sessions, settings.max_queued_requests,
                                     settings.admission_timeout_s, app.state.metrics)
     app.state.attachments = AttachmentStore(settings)
+    app.state.warm_pool = WarmPool(settings, settings.warm_pool_size,
+                                   max_idle_s=settings.warm_pool_max_idle_s)
     app.state.mcp = mcp
     app.state.conv_cache = ConversationCache(
         max_entries=settings.conversation_cache_max,

@@ -228,6 +228,18 @@ class Settings(BaseSettings):
     # How often a non-streaming request checks whether the client went away
     # (so the agy subprocess is killed instead of running to request_timeout_s).
     disconnect_poll_s: float = 1.0
+    # Tool results arriving for a conversation that is already gone (GC'd past
+    # suspended_ttl_s, or wiped by a restart): rebuild a fresh turn from the
+    # full history the stateless client resent (True) or answer 409 (False).
+    # A live conversation that is simply not waiting on these ids is always 409.
+    rebuild_on_expiry: bool = True
+
+    # ── Warm pool ───────────────────────────────────────────────────────────
+    # Pre-spawned idle agy procs for autonomous turns (see app/warmpool.py).
+    # 0 = off. Each idle proc is ~175 MB RSS and one conversation DB on disk;
+    # 1–2 is the useful range for a single user.
+    warm_pool_size: int = Field(default=0, ge=0, le=8)
+    warm_pool_max_idle_s: float = Field(default=600.0, gt=0)
 
     # ── Logging ────────────────────────────────────────────────────────────—
     log_level: str = "INFO"

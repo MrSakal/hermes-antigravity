@@ -131,8 +131,18 @@ def main():
                 pass
         return found
 
+    def metrics():
+        with urllib.request.urlopen(base + "/metrics", timeout=5) as response:
+            return json.load(response)
+
     for stream, tools in ((False, False), (True, False), (False, True), (True, True)):
+        # With a warm pool the request may ADOPT a pre-existing proc and the PID
+        # that newly appears is the background refill; ownership by PID delta is
+        # therefore not observable. Assert on the server's own accounting instead:
+        # a session was active mid-request, and after the disconnect the process
+        # count returns to exactly the idle pool and the session count to zero.
         before = agy_pids()
+        idle_before = metrics()["warm_pool_idle"]
         payload = request("Write a detailed 10000 word history of mathematics.", stream=stream,
                           **({"tools": [tool]} if tools else {}))
         body = json.dumps(payload).encode()
@@ -141,15 +151,19 @@ def main():
         with socket.create_connection(("127.0.0.1", args.port), timeout=5) as sock:
             sock.sendall(wire)
             deadline = time.monotonic() + 5
-            while time.monotonic() < deadline and not (agy_pids() - before):
+            while time.monotonic() < deadline and metrics()["sessions_active"] == 0:
                 time.sleep(0.05)
-            owned = agy_pids() - before
+            active = metrics()["sessions_active"]
+            seen = agy_pids()
         start = time.monotonic()
         deadline = start + 10
-        while time.monotonic() < deadline and owned & agy_pids():
+        while time.monotonic() < deadline and (metrics()["sessions_active"] or len(agy_pids()) > metrics()["warm_pool_idle"]):
             time.sleep(0.1)
-        check(f"disconnect stream={stream} tools={tools}", bool(owned) and not (owned & agy_pids()),
-              f"observed PIDs={sorted(owned)}, reaped in {time.monotonic() - start:.2f}s")
+        m = metrics()
+        check(f"disconnect stream={stream} tools={tools}",
+              active >= 1 and m["sessions_active"] == 0 and len(agy_pids()) == m["warm_pool_idle"],
+              f"procs during={sorted(seen - before) or sorted(seen)}, after={sorted(agy_pids())}, "
+              f"pool idle {idle_before}->{m['warm_pool_idle']}, reaped in {time.monotonic() - start:.2f}s")
 
     config = Path.home() / ".gemini/config/mcp_config.json"
     entries = json.loads(config.read_text()).get("mcpServers", {})
@@ -161,13 +175,12 @@ def main():
     # condition with the same bounded grace as disconnect/process cleanup above.
     cleanup_deadline = time.monotonic() + 10
     while True:
-        with urllib.request.urlopen(base + "/metrics", timeout=5) as response:
-            metrics = json.load(response)
-        if all(metrics.get(key) == 0 for key in idle_keys) or time.monotonic() >= cleanup_deadline:
+        snapshot = metrics()
+        if all(snapshot.get(key) == 0 for key in idle_keys) or time.monotonic() >= cleanup_deadline:
             break
         time.sleep(.05)
-    check("all resource counters return to zero", all(metrics.get(key) == 0 for key in idle_keys),
-          str({key: metrics.get(key) for key in idle_keys}))
+    check("all resource counters return to zero", all(snapshot.get(key) == 0 for key in idle_keys),
+          str({key: snapshot.get(key) for key in idle_keys}))
     print(f"RESULT: {sum(results)}/{len(results)} passed", flush=True)
     return 0 if all(results) else 1
 

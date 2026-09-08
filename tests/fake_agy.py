@@ -11,6 +11,8 @@ canned stdout stream picked by FAKE_AGY_SCRIPT:
   * "echoargs" — emit argv + the stdin prompt as JSON on one line
   * "echoprompt" — result whose response is "len=<chars>;tail=<last 8 chars>"
   * "hang"     — init + text, then sleep (simulates being blocked in MCP)
+  * "lostconv" — "echoprompt", but when --conversation is given behaves like
+                 agy 1.1.27 on a pruned DB: stderr warning and a NEW conv id
   * "models"   — (as `agy models` subcommand) print a catalog
 Sleeps FAKE_AGY_DELAY seconds (float, default 0) before the result line.
 """
@@ -22,6 +24,14 @@ import time
 MODE = os.environ.get("FAKE_AGY_SCRIPT", "simple")
 DELAY = float(os.environ.get("FAKE_AGY_DELAY", "0"))
 CONV = os.environ.get("FAKE_AGY_CONV_ID", "conv-fake-1")
+
+if MODE == "lostconv" and "--conversation" in sys.argv:
+    requested = sys.argv[sys.argv.index("--conversation") + 1]
+    sys.stderr.write(f'warning: conversation "{requested}" not found\n')
+    sys.stderr.flush()
+    CONV = "conv-fake-fresh"
+if MODE == "lostconv":
+    MODE = "echoprompt"
 
 
 def emit(obj):

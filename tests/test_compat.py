@@ -70,7 +70,8 @@ def test_api_v1_models_matches_v1_models():
     b = client.get("/v1/models")
     assert a.status_code == 200
     assert b.status_code == 200
-    assert a.json() == b.json()
+    strip = lambda body: {**body, "data": [{k: v for k, v in m.items() if k != "created"} for m in body["data"]]}
+    assert strip(a.json()) == strip(b.json())  # `created` is now(); a second boundary may fall between the two calls
 
 
 def test_healthz_carries_version():

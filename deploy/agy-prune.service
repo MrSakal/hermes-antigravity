@@ -1,0 +1,19 @@
+[Unit]
+Description=Prune agy CLI state (conversations, brain, logs, locks) older than 7 days
+Documentation=file:///home/hermes/hermes-antigravity/scripts/prune_agy_state.py
+
+[Service]
+Type=oneshot
+WorkingDirectory=/home/hermes/hermes-antigravity
+Environment=HOME=/home/hermes
+ExecStart=/home/hermes/hermes-antigravity/.venv/bin/python scripts/prune_agy_state.py --keep-days 7 --checkpoint --json
+# Exit 2 = an agy turn is live right now; the timer simply retries next run.
+SuccessExitStatus=2
+Nice=10
+IOSchedulingClass=idle
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/hermes/.gemini/antigravity-cli

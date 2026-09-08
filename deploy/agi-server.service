@@ -1,0 +1,25 @@
+[Unit]
+Description=Antigravity OpenAI Server for Hermes
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/hermes/hermes-antigravity
+EnvironmentFile=/home/hermes/hermes-antigravity/.env
+Environment=HOME=/home/hermes
+Environment=PATH=/home/hermes/.local/bin:/usr/local/bin:/usr/bin:/bin
+# Recreate the writable workspace outside the service filesystem sandbox if removed.
+ExecStartPre=+/usr/bin/install -d -m 0700 /home/hermes/agi-workspace
+ExecStart=/home/hermes/hermes-antigravity/.venv/bin/python -m uvicorn app.main:app --host 127.0.0.1 --port 8788
+Restart=on-failure
+RestartSec=3
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/hermes/agi-workspace /home/hermes/.gemini
+
+[Install]
+WantedBy=default.target

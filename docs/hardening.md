@@ -127,5 +127,34 @@ natively; enable `AGI_FLATTEN_MARKDOWN_TABLES=true` only for clients needing ASC
 The optional transform has bounded buffers and passes oversized lines/tables through
 without conversion rather than accumulating unbounded content.
 
-Persistent cross-turn CLI process reuse remains deliberately out of scope: profile
-startup overhead after correctness/lifecycle fixes before adding another stateful pool.
+## Warm pool and rebuild (ported from claude-code-openai-server)
+
+Profiling after the lifecycle fixes showed agy's boot (~3.5 s exec→`init`) is
+the dominant, prompt-independent cost of a turn. `AGI_WARM_POOL_SIZE` pre-boots
+that many procs with the prompt deferred (`AgySession(prompt=None)` + `send()`;
+`--print-timeout` only starts counting at the prompt, verified). Only fresh
+autonomous turns adopt; the pool holds one signature (model, workdir, agent) and
+re-targets to traffic. Pooled procs are outside the admission count until
+adopted, are recycled after `AGI_WARM_POOL_MAX_IDLE_S`, and are drained at
+shutdown. Disconnect cleanup of an adopted proc is covered by the live E2E,
+which asserts on `/metrics` (`sessions_active`, `warm_pool_idle`) rather than
+PID deltas, since the newly appearing PID under a pool is the background refill.
+
+`AGI_REBUILD_ON_EXPIRY` turns a tool continuation for a vanished conversation
+into a fresh turn folded from the full history (the transcript carries the
+assistant's `tool_calls` and the `tool` results, now rendered as
+`[result of <id>]`). A conversation that is alive but not waiting on these ids
+(`DuplicateContinuation`) is never rebuilt and stays 409 — rebuilding would run
+the turn twice.
+
+## agy-side state
+
+The bridge never resumes a conversation older than `AGI_CONVERSATION_CACHE_TTL_S`
+(1 h), and agy answers `--conversation <pruned id>` with a stderr warning and a
+**new** conversation. The route compares the `init` conversation id against the
+requested one and refolds the whole history on mismatch, so pruning agy's
+`conversations/` is safe for the bridge. `scripts/prune_agy_state.py` +
+`deploy/agy-prune.timer` implement that retention (default 7 days, WAL
+checkpoint of kept DBs). The script refuses to run while an `agy --print`
+process is live. Interactive agy sessions on the same host are not
+distinguishable from bridge turns; raise `--keep-days` if you rely on them.

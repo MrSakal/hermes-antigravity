@@ -129,6 +129,9 @@ automatically. The systemd example below uses `EnvironmentFile`.
 | `AGI_SUSPENDED_TTL_S` | `300` | How long a tool-suspended conversation may wait for its results before GC. |
 | `AGI_IDLE_SESSION_TTL_S` | `900` | Idle conversation eviction age. |
 | `AGI_GC_INTERVAL_S` | `30` | GC sweep interval. |
+| `AGI_REBUILD_ON_EXPIRY` | `true` | Rebuild an expired tool continuation from the resent history instead of 409. |
+| `AGI_WARM_POOL_SIZE` | `0` | Pre-booted idle agy procs for fresh autonomous turns (see [Warm pool](#warm-pool)). |
+| `AGI_WARM_POOL_MAX_IDLE_S` | `600` | Recycle an idle pooled proc after this many seconds. |
 | `AGI_LOG_LEVEL` | `INFO` | Log level. |
 | `AGI_TIMING_LOG` | `false` | Emit per-turn latency metrics to the `agi.timing` logger. |
 
@@ -231,6 +234,30 @@ conflicting values are rejected.
 
 See [hardening and operational limits](docs/hardening.md) for session admission,
 request/image/schema caps, attachment retention, error semantics, and migration.
+
+### Warm pool
+
+agy boots for ~3.5 s before it reads its prompt, on every turn, regardless of
+the prompt. `AGI_WARM_POOL_SIZE=N` keeps `N` procs pre-booted with the prompt
+deferred; a fresh autonomous turn whose model/workdir/agent match adopts one and
+pays only model latency. Measured on this host (Gemini 3.8 Flash Low, short
+prompt): **5.5 s → 1.5 s** per turn, TTFT p50 1.26 s. Conversation-cache
+resumes (`--conversation` is spawn-time argv) and tool turns (per-conversation
+MCP slot) always cold-start. Each idle proc is ~175 MB RSS and one conversation
+DB on disk; 1–2 is the sane range for one user. `/metrics` exposes
+`warm_pool_idle` / `warm_pool_hits` / `warm_pool_misses`.
+
+### agy leaves state behind
+
+The CLI persists every conversation, transcript and per-process log under
+`~/.gemini/antigravity-cli` with no retention, and does not checkpoint its
+SQLite WALs (measured: 480 MB after ~900 turns, 255 MB of it WAL).
+`scripts/prune_agy_state.py` removes conversations older than `--keep-days`
+(db + wal + brain + presence lock as a unit), stale logs and orphan locks, and
+with `--checkpoint` folds the kept WALs back into their DBs. `deploy/` ships a
+daily systemd user timer for it. The bridge tolerates pruned conversations: a
+resume of a missing id is detected from agy's `init` (it silently starts a new
+conversation) and the full history is refolded.
 
 ## The shared MCP config
 

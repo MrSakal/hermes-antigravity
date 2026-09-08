@@ -44,6 +44,9 @@ async def metrics(request: Request):
                 sessions_suspended=sum(c.state == 'suspended' for c in conversations),
                 tool_stdout_queue_depth=sum(c.session._queue.qsize() for c in conversations),
                 mcp_transport_sessions=len(state.mcp.session_manager._server_instances),
+                warm_pool_idle=state.warm_pool.idle,
+                warm_pool_hits=state.warm_pool.hits,
+                warm_pool_misses=state.warm_pool.misses,
                 attachment_workspaces_pinned=len(state.attachments.pins))
     return data
 

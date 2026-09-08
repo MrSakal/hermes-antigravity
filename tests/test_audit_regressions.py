@@ -197,7 +197,10 @@ async def test_close_reaps_child_processes(tmp_path, monkeypatch):
         child_pid = int(sess.raw_tail[-1])
         await sess.aclose()
         stat = Path(f'/proc/{child_pid}/stat')
-        alive = stat.exists() and stat.read_text().split()[2] != 'Z'
+        try:
+            alive = stat.read_text().split()[2] != 'Z'
+        except (FileNotFoundError, ProcessLookupError):
+            alive = False  # reaped between exists() and read(): the outcome we want
         assert not alive, f'Child PID {child_pid} survived AgySession.aclose()'
     finally:
         await sess.aclose()

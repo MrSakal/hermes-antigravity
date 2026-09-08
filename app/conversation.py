@@ -30,7 +30,7 @@ import asyncio
 
 import logging
 import time
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional, Union
@@ -128,6 +128,12 @@ class Conversation:
 
 class ExpiredContinuation(Exception):
     """A continuation whose tool_call_ids match no suspended conversation."""
+
+
+class DuplicateContinuation(ExpiredContinuation):
+    """A continuation for a conversation that is alive but not waiting on these
+    ids — a second copy of a turn already claimed. Never rebuilt: the first copy
+    is (or was) running it."""
 
 
 class ConversationManager:
@@ -302,13 +308,17 @@ class ConversationManager:
         async with self._lock:
             owners = {self._pending_index.get(tid) for tid in ids}
             if len(owners) != 1 or None in owners:
+                if any(self._pending_index.get(tid) for tid in ids):
+                    raise DuplicateContinuation("tool results span or partially match a live conversation")
                 raise ExpiredContinuation("tool results must belong to one suspended conversation")
             conv = self._conversations.get(next(iter(owners)))
             if conv is None or conv.state != SUSPENDED:
+                if conv is not None:
+                    raise DuplicateContinuation("conversation is not waiting on these tool results")
                 raise ExpiredContinuation("tool results reference an expired or unknown conversation")
             indexed = {tid for tid, cid in self._pending_index.items() if cid == conv.conv_id}
             if set(ids) != indexed or set(ids) != set(conv.bridge.pending_ids):
-                raise ExpiredContinuation("continuation must supply every pending tool result exactly once")
+                raise DuplicateContinuation("continuation must supply every pending tool result exactly once")
             if req.model is not None and (model if model is not None else req.model) != conv.model:
                 raise ExpiredContinuation("continuation model does not match the suspended conversation")
             if req.workdir is not None:
@@ -325,6 +335,32 @@ class ConversationManager:
                 conv.bridge.resolve(tid, result)
         logger.info("conv=%s resumed (%d tool results)", conv.conv_id, len(results))
         return conv
+
+    async def resume_or_rebuild(
+        self, req: ChatCompletionRequest, *, model: str, workdir: Path,
+        before_create: Optional[Callable[[], Awaitable[None]]] = None,
+    ) -> Conversation:
+        """:meth:`resume`, or — when the suspended conversation is gone and
+        ``settings.rebuild_on_expiry`` — a fresh :meth:`create` from the full
+        history the stateless client resent. The transcript already carries the
+        assistant's tool_calls and the tool results, so the model produces the
+        next turn as it would have; only the 409 the client could not retry is
+        avoided. Ported from schmarta/claude-code-openai-server.
+
+        ``before_create`` runs only on the rebuild path — the route uses it to
+        acquire the session permit a plain resume does not need."""
+        try:
+            return await self.resume(req, model=model, workdir=workdir)
+        except DuplicateContinuation:
+            raise
+        except ExpiredContinuation:
+            if not self.settings.rebuild_on_expiry:
+                raise
+            logger.info("continuation expired; rebuilding a fresh %s turn from %d messages",
+                        model, len(req.messages))
+            if before_create is not None:
+                await before_create()
+            return await self.create(req, model=model, workdir=workdir)
 
     # ── turn loop ─────────────────────────────────────────────────────────—
 

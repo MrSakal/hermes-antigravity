@@ -198,10 +198,15 @@ def fold_conversation(convo: list[ChatMessage]) -> str:
                 f"{tc.function.name}({tc.function.arguments or ''})" for tc in m.tool_calls
             )
             text = (text + " " if text else "") + f"[called tools: {calls}]"
+        elif m.role == "tool" and m.tool_call_id:
+            text = f"[result of {m.tool_call_id}] {text}"
         if text:
             lines.append(f"{_role_label(m.role)}: {text}")
     last = convo[-1]
-    last_line = f"{_role_label(last.role)}: {message_text(last)}"
+    last_text = message_text(last)
+    if last.role == "tool" and last.tool_call_id:
+        last_text = f"[result of {last.tool_call_id}] {last_text}"
+    last_line = f"{_role_label(last.role)}: {last_text}"
     if lines:
         return (
             "Conversation so far:\n"

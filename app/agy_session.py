@@ -16,6 +16,12 @@ an empty value) to select print mode; ``-p --input-format`` would swallow the
 flag as the prompt. stdin is closed after the single line, so agy runs exactly
 one turn and exits.
 
+The prompt may be deferred: ``prompt=None`` spawns the process and lets it boot
+(~3.5 s on this host, measured against 1.1.27) without a user turn; a later
+:meth:`send` delivers the NDJSON line. ``--print-timeout`` starts counting at
+the first prompt, not at boot (verified: an idle process outlived a 15 s
+timeout), which is what makes :mod:`app.warmpool` possible.
+
 A reader task parses stdout JSONL lines into :data:`~app.events.ChatEvent`
 values pushed onto an :class:`asyncio.Queue`; :data:`STREAM_CLOSED` marks EOF
 (process exit). The last few unparseable stdout lines and a stderr tail are kept
@@ -77,7 +83,7 @@ class AgySession:
         agy_bin: str,
         model: Optional[str],
         workdir: Union[str, Path],
-        prompt: str,
+        prompt: Optional[str] = None,
         conversation_id: Optional[str] = None,
         agent: Optional[str] = None,
         print_timeout_s: int = 600,
@@ -109,6 +115,8 @@ class AgySession:
         self._stdin_task: Optional[asyncio.Task[None]] = None
         self._closed = False
         self._eof = False
+        self._sent = False
+        self.spawned_at: Optional[float] = None
         self._available = asyncio.Event()
         self._writer_error: Optional[Error] = None
         self._close_task: Optional[asyncio.Task[None]] = None
@@ -147,16 +155,18 @@ class AgySession:
     # ── lifecycle ─────────────────────────────────────────────────────────—
 
     async def start(self) -> None:
-        """Spawn the subprocess (idempotent) and launch reader/stderr tasks."""
+        """Spawn the subprocess (idempotent) and launch reader/stderr tasks.
+
+        Feeds the prompt immediately when one was given at construction;
+        otherwise the process idles until :meth:`send`."""
         if self._closed:
             raise RuntimeError("session is closed")
         if self._proc is not None:
             return
         args = self._build_args()
-        payload = stdin_payload(self.prompt)
         logger.info(
-            "spawning agy: model=%s workdir=%s conv=%s agent=%s prompt_bytes=%d",
-            self.model, self.workdir, self.conversation_id, self.agent, len(payload),
+            "spawning agy: model=%s workdir=%s conv=%s agent=%s deferred=%s",
+            self.model, self.workdir, self.conversation_id, self.agent, self.prompt is None,
         )
         spawn_t0 = time.monotonic()
         try:
@@ -176,17 +186,37 @@ class AgySession:
             ) from e
         if os.name == "posix":
             self._pgid = self._proc.pid
+        self.spawned_at = time.monotonic()
         log_spawn(self.timing_log, self.timing_label, (time.monotonic() - spawn_t0) * 1000)
         self._reader_task = asyncio.create_task(self._read_stdout(), name="agy-stdout")
         self._stderr_task = asyncio.create_task(self._read_stderr(), name="agy-stderr")
-        # Feed the prompt in the background: agy takes a few seconds to boot
-        # before it drains stdin, and a payload larger than the pipe buffer
-        # would otherwise block start() (and the HTTP response) for that long.
+        if self.prompt is not None:
+            self.send(self.prompt)
+
+    def send(self, prompt: str) -> None:
+        """Deliver the single user turn. Exactly once per process.
+
+        Runs in the background: agy takes seconds to boot before it drains
+        stdin, and a payload larger than the pipe buffer would otherwise block
+        the caller (and the HTTP response) for that long."""
+        if self._proc is None:
+            raise RuntimeError("session not started")
+        if self._sent:
+            raise RuntimeError("prompt already sent")
+        self._sent = True
+        self.prompt = prompt
+        payload = stdin_payload(prompt)
+        logger.debug("agy stdin: %d bytes", len(payload))
         self._stdin_task = asyncio.create_task(self._feed_stdin(payload), name="agy-stdin")
 
     @property
     def running(self) -> bool:
         return self._proc is not None and self._proc.returncode is None
+
+    @property
+    def idle_s(self) -> float:
+        """Seconds since spawn; meaningful for pooled, not-yet-prompted procs."""
+        return 0.0 if self.spawned_at is None else time.monotonic() - self.spawned_at
 
     async def _feed_stdin(self, payload: bytes) -> None:
         assert self._proc is not None and self._proc.stdin is not None

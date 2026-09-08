@@ -77,6 +77,7 @@ from app.translate import (
     tool_calls_chunk,
     usage_from_turn,
 )
+from app.warmpool import Signature
 
 logger = logging.getLogger("agi.chat")
 
@@ -215,6 +216,14 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             status_code=503, code="agent_unavailable",
         )
 
+    def fold_full_prompt() -> str:
+        nonlocal convo
+        if settings.image_input:
+            convo = materialize_messages(convo, workdir)
+        # No agent (mode off, or plugin dir unwritable) → automatic fallback:
+        # the system message rides as an instruction preamble instead.
+        return build_prompt(convo, system, inject_system=(agent is None or not settings.system_prompt_via_agent))
+
     # ── conversation-cache hit: resume with only the newest user message ─────
     cache_namespace = json.dumps([model, str(workdir.resolve()), agent,
                                   settings.plain_chat_tools, settings.system_prompt_via_agent,
@@ -228,36 +237,24 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
         conversation_id = hit.conversation_id
         logger.info("conv-cache hit → resuming agy conversation %s", conversation_id)
     else:
-        if settings.image_input:
-            convo = materialize_messages(convo, workdir)
-        # No agent (mode off, or plugin dir unwritable) → automatic fallback:
-        # the system message rides as an instruction preamble instead.
-        prompt = build_prompt(convo, system, inject_system=(agent is None or not settings.system_prompt_via_agent))
+        prompt = fold_full_prompt()
         conversation_id = None
 
     if not prompt.strip():
         raise OpenAIError("no user content in messages", status_code=400, param="messages")
     check_prompt_size(prompt, settings)
 
-    sess = AgySession(
-        agy_bin=settings.agy_bin,
-        model=model,
-        workdir=workdir,
-        prompt=prompt,
-        conversation_id=conversation_id,
-        agent=agent,
-        print_timeout_s=settings.request_timeout_s,
-        disable_slash_commands=settings.disable_slash_commands,
-        timing_log=settings.timing_log,
-        timing_label="autonomous",
-        event_queue_size=settings.event_queue_size,
-        stdin_timeout_s=settings.stdin_timeout_s,
-    )
-    request.state.session_cleanup = sess.aclose
-    try:
-        await asyncio.wait_for(sess.start(), timeout=_remaining(request, settings))
-    except asyncio.TimeoutError as exc:
-        raise OpenAIError('upstream startup timeout', status_code=504, type='timeout_error') from exc
+    sess = await _spawn_autonomous(request, settings, model, workdir, agent, prompt, conversation_id)
+    if conversation_id is not None and sess is None:
+        # agy answered the resume with a NEW conversation (its DB was pruned or
+        # lost): it would see only the newest message. Fold the whole history
+        # into a fresh turn instead — same result as a cache miss, one boot later.
+        logger.warning("agy could not resume %s; folding full history into a fresh turn", conversation_id)
+        conversation_id = None
+        prompt = fold_full_prompt()
+        check_prompt_size(prompt, settings)
+        sess = await _spawn_autonomous(request, settings, model, workdir, agent, prompt, None)
+    assert sess is not None
 
     cid = new_completion_id()
     created = now()
@@ -286,6 +283,51 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
         return JSONResponse(status_code=499, content=error_envelope(
             "client closed request", type="client_disconnected"))
     return JSONResponse(content=body)
+
+
+async def _spawn_autonomous(request: Request, settings: Settings, model: str, workdir,
+                            agent: Optional[str], prompt: str,
+                            conversation_id: Optional[str]) -> Optional[AgySession]:
+    """Start the turn's agy process and wait for its ``init`` line.
+
+    Fresh turns may adopt a pre-booted proc from the warm pool; a resume fixes
+    ``--conversation`` at spawn and always cold-starts. Returns ``None`` when a
+    resume was silently turned into a new conversation by agy (verified on
+    1.1.27: ``warning: conversation ... not found`` on stderr, then an ``init``
+    carrying a different id) so the caller can fall back to a full fold. Any
+    other first event is pushed back for the stream/collect loop."""
+    sess = None
+    if conversation_id is None:
+        sess = await request.app.state.warm_pool.acquire(
+            Signature(model=model, workdir=str(workdir), agent=agent))
+    if sess is not None:
+        request.state.session_cleanup = sess.aclose
+        sess.send(prompt)
+    else:
+        sess = AgySession(
+            agy_bin=settings.agy_bin, model=model, workdir=workdir, prompt=prompt,
+            conversation_id=conversation_id, agent=agent,
+            print_timeout_s=settings.request_timeout_s,
+            disable_slash_commands=settings.disable_slash_commands,
+            timing_log=settings.timing_log, timing_label="autonomous",
+            event_queue_size=settings.event_queue_size, stdin_timeout_s=settings.stdin_timeout_s,
+        )
+        request.state.session_cleanup = sess.aclose
+        try:
+            await asyncio.wait_for(sess.start(), timeout=_remaining(request, settings))
+        except asyncio.TimeoutError as exc:
+            raise OpenAIError('upstream startup timeout', status_code=504, type='timeout_error') from exc
+    if conversation_id is None:
+        return sess  # fresh turn: nothing to validate, stream headers go out at once
+    first = await sess.next_event(timeout=_remaining(request, settings))
+    if (isinstance(first, Init) and first.conversation_id
+            and first.conversation_id != conversation_id):
+        request.state.session_cleanup = None
+        await sess.aclose()
+        return None
+    if first is not None:
+        sess.push_back(first)
+    return sess
 
 
 async def _stream(
@@ -475,20 +517,27 @@ async def _handle_tools(
     mgr: ConversationManager = request.app.state.conv_manager
     settings = get_settings()
 
-    if mgr.is_continuation(req):
-        try:
-            conv = await mgr.resume(req, model=model, workdir=workdir)
-        except ExpiredContinuation as e:
-            raise OpenAIError(
-                str(e), status_code=409, type="invalid_request_error",
-                code="tool_result_expired",
-            )
-    else:
-        try:
+    rebuilt = False
+
+    async def admit_for_rebuild():
+        nonlocal rebuilt
+        rebuilt = True
+        request.state.resource_releases.append(await request.app.state.admission.acquire(request))
+
+    try:
+        if mgr.is_continuation(req):
+            conv = await asyncio.wait_for(
+                mgr.resume_or_rebuild(req, model=model, workdir=workdir, before_create=admit_for_rebuild),
+                timeout=_remaining(request, settings))
+        else:
+            rebuilt = True  # fresh turn: the permit acquired by the caller is ours to hand over
             conv = await asyncio.wait_for(mgr.create(req, model=model, workdir=workdir),
                                           timeout=_remaining(request, settings))
-        except TimeoutError as exc:
-            raise OpenAIError('upstream startup timeout', status_code=504, type='timeout_error') from exc
+    except ExpiredContinuation as e:
+        raise OpenAIError(str(e), status_code=409, type="invalid_request_error", code="tool_result_expired")
+    except TimeoutError as exc:
+        raise OpenAIError('upstream startup timeout', status_code=504, type='timeout_error') from exc
+    if rebuilt:
         releases = request.state.resource_releases
         request.state.resource_releases = []
         def release_resources():
