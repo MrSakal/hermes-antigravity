@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 
 import pytest
@@ -9,6 +10,8 @@ from app.events import Error, Init, TextDelta, ToolStep, TurnDone
 
 
 async def drain(sess: AgySession) -> list:
+    """Events of ONE turn: up to its result line (the process persists), or
+    up to EOF when the process dies without one."""
     events = []
     while True:
         ev = await sess.next_event(timeout=15)
@@ -16,6 +19,8 @@ async def drain(sess: AgySession) -> list:
         if ev is STREAM_CLOSED:
             break
         events.append(ev)
+        if isinstance(ev, (TurnDone, Error)):
+            break
     return events
 
 
@@ -155,3 +160,118 @@ async def test_missing_binary_raises(tmp_path):
     )
     with pytest.raises(RuntimeError, match="agy CLI not found"):
         await sess.start()
+
+
+async def test_process_survives_turn_and_takes_the_next(fake_agy, tmp_path):
+    """stdin stays open after a turn: the same process answers the next one
+    on the same agy conversation, and init is printed once, at boot."""
+    fake_agy("echo")
+    sess = make_session(tmp_path, prompt=None)
+    await sess.start()
+    assert await sess.wait_started(10)  # init at boot, before any message
+    first = await sess.next_event(timeout=5)
+    assert isinstance(first, Init)
+    sess.send("one")
+    t1 = await drain(sess)
+    sess.send("two")
+    t2 = await drain(sess)
+    assert [e.response_text for e in t1 if isinstance(e, TurnDone)] == ["echo: one"]
+    assert [e.response_text for e in t2 if isinstance(e, TurnDone)] == ["echo: two"]
+    assert not any(isinstance(e, Init) for e in t1 + t2)
+    assert sess.running and sess.turns_sent == 2
+    await sess.aclose(graceful=True)
+    assert sess._proc.returncode == 0  # stdin EOF -> clean exit, not a kill
+
+
+async def test_persistent_session_disables_print_timeout(fake_agy, tmp_path):
+    fake_agy("echoargs")
+    sess = AgySession(agy_bin="agy", model=None, workdir=tmp_path, prompt="x")
+    await sess.start()
+    await drain(sess)
+    await sess.aclose()
+    argv = json.loads(next(l for l in sess.raw_tail if l.startswith('{"argv"')))["argv"]
+    assert argv[argv.index("--print-timeout") + 1] == "0s"
+
+
+async def test_kill_now_is_synchronous_and_closed_event_fires(fake_agy, tmp_path):
+    fake_agy("hang", FAKE_AGY_HANG_S="30")
+    sess = make_session(tmp_path)
+    await sess.start()
+    assert await sess.wait_started(10)
+    sess.kill_now()  # no await: must already be on its way down
+    await sess.aclose()
+    assert sess.closed_event.is_set() and not sess.running
+    assert sess._proc.returncode is not None
+
+
+async def test_injected_items_share_the_event_stream(fake_agy, tmp_path):
+    fake_agy("simple")
+    sess = make_session(tmp_path, prompt=None)
+    await sess.start()
+    marker = object()
+    waiter = asyncio.create_task(sess.next_event(timeout=10))
+    first = await waiter  # boot init
+    assert isinstance(first, Init)
+    sess.inject(marker)
+    assert await sess.next_event(timeout=1) is marker
+    await sess.aclose()
+
+
+@pytest.mark.skipif(not hasattr(__import__("os"), "killpg"), reason="POSIX process groups")
+async def test_no_group_kill_after_leader_already_reaped(fake_agy, tmp_path, monkeypatch):
+    """Once the leader exited (and was reaped) before teardown began, its pgid
+    may belong to an unrelated process group: never killpg it."""
+    import os
+
+    fake_agy("simple")
+    sess = AgySession(agy_bin="agy", model="m", workdir=tmp_path, prompt=None)
+    await sess.start()
+    assert await sess.wait_started(10)
+    sess._proc.kill()
+    await sess._proc.wait()
+    calls = []
+    monkeypatch.setattr(os, "killpg", lambda pgid, sig: calls.append((pgid, sig)))
+    await sess.aclose()
+    assert calls == []
+
+
+@pytest.mark.skipif(not hasattr(__import__("os"), "killpg"), reason="POSIX process groups")
+async def test_group_kill_when_leader_alive_at_teardown(fake_agy, tmp_path, monkeypatch):
+    import os
+
+    fake_agy("simple")
+    sess = AgySession(agy_bin="agy", model="m", workdir=tmp_path, prompt=None)
+    await sess.start()
+    assert await sess.wait_started(10)
+    real = os.killpg
+    calls = []
+
+    def spy(pgid, sig):
+        calls.append(sig)
+        real(pgid, sig)
+    monkeypatch.setattr(os, "killpg", spy)
+    await sess.aclose()
+    assert calls  # SIGKILL to the group while the leader was alive
+
+
+async def test_boot_eof_sets_boot_failed_with_stderr(fake_agy, tmp_path):
+    fake_agy("bootfail")
+    sess = AgySession(agy_bin="agy", model="m", workdir=tmp_path, prompt=None)
+    await sess.start()
+    assert await sess.wait_started(10)  # EOF releases the waiter...
+    assert sess.boot_failed  # ...but it is a failed boot
+    assert "not signed in" in await sess.exit_diagnostics()
+    await sess.aclose()
+
+
+@pytest.mark.skipif(not __import__("os").path.isdir("/proc"), reason="Linux /proc")
+def test_recycled_pgid_is_never_considered_ours(tmp_path):
+    """A live process whose PID equals our (reaped) leader's pgid means the
+    number was recycled: never treat that group as ours."""
+    import os
+
+    sess = AgySession(agy_bin="agy", model="m", workdir=tmp_path, prompt=None)
+    sess._pgid = os.getpid()  # a live process holds that PID now
+    assert sess._orphaned_group_alive() is False
+    sess._pgid = None
+    assert sess._orphaned_group_alive() is False

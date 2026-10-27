@@ -12,7 +12,7 @@ from app.config import get_settings
 
 
 @pytest.fixture
-def client(fake_agy, fake_agy_bin, monkeypatch, tmp_path):
+async def client(fake_agy, fake_agy_bin, monkeypatch, tmp_path):
     monkeypatch.setenv("AGI_DEFAULT_WORKDIR", str(tmp_path / "ws"))
     # Never touch the user's real shared Antigravity MCP config / plugin dir
     # from tests.
@@ -27,6 +27,10 @@ def client(fake_agy, fake_agy_bin, monkeypatch, tmp_path):
     application = main_mod.create_app()
     transport = httpx.ASGITransport(app=application)
     yield httpx.AsyncClient(transport=transport, base_url="http://test"), application
+    # Processes now outlive their turn (parked IDLE); tests that do not run
+    # the lifespan must still reap them.
+    await application.state.conv_manager.close_all()
+    await application.state.warm_pool.stop()
     get_settings.cache_clear()
 
 
@@ -34,7 +38,7 @@ async def test_nonstream_simple(client, fake_agy):
     fake_agy("simple")
     http, _ = client
     r = await http.post("/v1/chat/completions", json={
-        "model": "gemini-3.7-flash",
+        "model": "gemini-3.8-flash",
         "messages": [{"role": "user", "content": "hi"}],
     })
     assert r.status_code == 200
@@ -51,7 +55,7 @@ async def test_stream_simple(client, fake_agy):
     fake_agy("simple")
     http, _ = client
     r = await http.post("/v1/chat/completions", json={
-        "model": "gemini-3.7-flash",
+        "model": "gemini-3.8-flash",
         "stream": True,
         "messages": [{"role": "user", "content": "hi"}],
     })
@@ -100,23 +104,40 @@ async def test_noise_surfaces_diagnostics(client, fake_agy):
     assert "no output produced" in r.json()["error"]["message"]
 
 
-async def test_conv_cache_roundtrip(client, fake_agy):
-    fake_agy("simple")
+async def test_follow_up_reuses_the_parked_process(client, fake_agy):
+    """Cross-turn reuse: the follow-up adopts the IDLE process and agy gets
+    ONLY the newest user message (the echo proves what reached stdin)."""
+    fake_agy("echo")
     http, application = client
+    mgr = application.state.conv_manager
     first = [{"role": "user", "content": "q1"}]
     r = await http.post("/v1/chat/completions", json={"messages": first})
     assert r.status_code == 200
-    assert len(application.state.conv_cache) == 1
+    answer = r.json()["choices"][0]["message"]["content"]
+    assert answer == "echo: q1"
+    [conv] = mgr._conversations.values()
+    pid = conv.session.pid
+    assert conv.state == "idle"
 
-    # Follow-up: previous transcript + assistant reply + new user message.
-    nxt = first + [
-        {"role": "assistant", "content": "Hello world"},
-        {"role": "user", "content": "q2"},
-    ]
+    nxt = first + [{"role": "assistant", "content": answer + "\n"},  # clients trim/pad
+                   {"role": "user", "content": "q2"}]
     r2 = await http.post("/v1/chat/completions", json={"messages": nxt})
     assert r2.status_code == 200
-    # A claim consumes the old mutable prefix; only its replacement remains.
-    assert len(application.state.conv_cache) == 1
+    assert r2.json()["choices"][0]["message"]["content"] == "echo: q2"
+    assert conv.session.pid == pid and conv.state == "idle"
+    assert mgr.stats["reuse_hits"] == 1
+    metrics = (await http.get("/metrics")).json()
+    assert metrics["reuse_hits"] == 1 and metrics["processes_idle"] == 1
+    assert metrics["sessions_active"] == 0  # the permit is released at park
+
+    # An edited history (the client changed the assistant text) never adopts it.
+    edited = first + [{"role": "assistant", "content": "something else"},
+                      {"role": "user", "content": "q3"}]
+    r3 = await http.post("/v1/chat/completions", json={"messages": edited})
+    assert r3.status_code == 200
+    assert r3.json()["choices"][0]["message"]["content"].startswith("echo: Conversation so far")
+    assert mgr.stats["reuse_misses"] == 1
+    await mgr.close_all()
 
 
 async def test_tools_request_without_tool_use_completes(client, fake_agy, tmp_path):
@@ -132,15 +153,15 @@ async def test_tools_request_without_tool_use_completes(client, fake_agy, tmp_pa
     body = r.json()
     assert body["choices"][0]["finish_reason"] == "stop"
     assert body["choices"][0]["message"]["content"]
-    # Conversation closed → our slot entry removed again.
-    cfg_path = tmp_path / "mcp_config.json"
-    if cfg_path.exists():
-        assert "hermes" not in json.loads(cfg_path.read_text())["mcpServers"]
+    # The MCP server rides in the agent file; the shared config is never written.
+    assert not (tmp_path / "mcp_config.json").exists()
+    agent_md = (tmp_path / "agent-plugin" / "agents" / "hermes.md").read_text()
+    assert "inheritMcp: false" in agent_md and "mcpServers:" in agent_md
 
 
 async def test_system_message_materializes_agent(client, fake_agy, tmp_path):
-    """A system message becomes a generated agent definition in the managed
-    plugin (delivered to agy via --agent) instead of a prompt preamble."""
+    """A system message becomes the body of the ONE managed agent file
+    (delivered to agy via --agent hermes) instead of a prompt preamble."""
     fake_agy("simple")
     http, _ = client
     r = await http.post("/v1/chat/completions", json={
@@ -150,8 +171,8 @@ async def test_system_message_materializes_agent(client, fake_agy, tmp_path):
         ],
     })
     assert r.status_code == 200
-    agents = list((tmp_path / "agent-plugin" / "agents").glob("hermes-*.md"))
-    assert len(agents) == 1
+    agents = list((tmp_path / "agent-plugin" / "agents").glob("*.md"))
+    assert [p.name for p in agents] == ["hermes.md"]
     assert "You are a pirate." in agents[0].read_text()
 
 
@@ -269,10 +290,8 @@ async def test_prompt_size_guard_on_tool_path(client, monkeypatch, tmp_path):
     })
     assert r.status_code == 400
     assert r.json()["error"]["code"] == "context_length_exceeded"
-    # No MCP slot leaked.
-    cfg_path = tmp_path / "mcp_config.json"
-    if cfg_path.exists():
-        assert json.loads(cfg_path.read_text())["mcpServers"] == {}
+    # Nothing leaked into the shared MCP config.
+    assert not (tmp_path / "mcp_config.json").exists()
 
 
 async def test_large_prompt_reaches_agy_over_stdin(client, fake_agy):
@@ -322,9 +341,9 @@ async def test_plain_chat_agent_is_readonly_by_default(client, fake_agy, tmp_pat
         "messages": [{"role": "user", "content": "summarize this web page: ..."}],
     })
     assert r.status_code == 200
-    agents = list((tmp_path / "agent-plugin" / "agents").glob("hermes-*.md"))
-    assert len(agents) == 1
-    assert 'tools: ["view_file"]' in agents[0].read_text()
+    agent_md = (tmp_path / "agent-plugin" / "agents" / "hermes.md").read_text()
+    assert "tools: [view_file]\n" in agent_md  # agy 1.4.8 list form
+    assert "inheritMcp: false" in agent_md and "mcpServers" not in agent_md
 
 
 async def test_tool_turn_agent_keeps_full_tools(client, fake_agy, tmp_path):
@@ -338,9 +357,10 @@ async def test_tool_turn_agent_keeps_full_tools(client, fake_agy, tmp_path):
         "tools": [{"type": "function", "function": {"name": "get_weather"}}],
     })
     assert r.status_code == 200
-    agents = list((tmp_path / "agent-plugin" / "agents").glob("hermes-*.md"))
-    assert len(agents) == 1
-    assert 'tools: "*"' in agents[0].read_text()
+    agent_md = (tmp_path / "agent-plugin" / "agents" / "hermes.md").read_text()
+    # Full builtin set incl. call_mcp_tool = no `tools:` field on agy 1.4.8
+    # (the old `tools: "*"` makes 1.4.8 skip the agent).
+    assert "tools:" not in agent_md and "You are an agent." in agent_md
 
 
 async def test_nonstream_client_disconnect_kills_subprocess(client, fake_agy, monkeypatch):
@@ -386,11 +406,11 @@ async def test_models_endpoint_static_fallback(client):
     http, _ = client
     r = await http.get("/v1/models")
     ids = [m["id"] for m in r.json()["data"]]
-    assert "gemini-3.8-flash" not in ids  # family remains an input alias only
-    assert "gemini-3.8-flash-high" in ids
-    assert "Gemini 3.8 Flash (Medium)" not in ids
+    # Superset: variant slugs, then family slugs, then display names.
+    assert ids.index("gemini-3.8-flash-high") < ids.index("gemini-3.8-flash")
+    assert ids.index("gemini-3.8-flash") < ids.index("Gemini 3.8 Flash (Medium)")
     assert "gemini-3.8-flash-medium" in ids
-    assert "claude-opus-4-6-thinking" in ids  # agy's own slug spelling
+    assert "claude-opus-5-5" in ids  # agy's own slug spelling
 
 
 async def test_models_endpoint_live_catalog(client):
@@ -398,9 +418,9 @@ async def test_models_endpoint_live_catalog(client):
     async with application.router.lifespan_context(application):
         r = await http.get("/v1/models")
         ids = [m["id"] for m in r.json()["data"]]
-        assert "gemini-9.9-flash" not in ids  # bare family is an input alias
+        assert "gemini-9.9-flash" in ids  # family slug advertised too
         assert "gemini-9.9-flash-medium" in ids
-        assert "Gemini 9.9 Flash (Low)" not in ids
+        assert "Gemini 9.9 Flash (Low)" in ids  # and agy's display names
         assert "gemini-9.9-flash-low" in ids
         assert "gemini-3.8-flash" not in ids  # static table not mixed in
         r = await http.get("/v1/models/gemini-9.9-flash")
@@ -458,9 +478,8 @@ async def test_real_asgi_disconnect(client, fake_agy, monkeypatch, stream, tools
 
 
 async def test_readonly_agent_failure_fails_closed(client, monkeypatch):
-    from unittest.mock import AsyncMock
     http, application = client
-    monkeypatch.setattr(application.state.agent_plugin, "ensure_agent", AsyncMock(return_value=None))
+    monkeypatch.setattr(application.state.agent_plugin, "available", lambda: False)
     response = await http.post("/v1/chat/completions", json={"messages": [{"role": "user", "content": "hi"}]})
     assert response.status_code == 503
     assert response.json()["error"]["code"] == "agent_unavailable"
@@ -472,4 +491,4 @@ async def test_readonly_survives_system_agent_disabled(client, fake_agy, monkeyp
     http, _ = client
     response = await http.post("/v1/chat/completions", json={"messages": [{"role": "user", "content": "hi"}]})
     assert response.status_code == 200
-    assert any('tools: ["view_file"]' in p.read_text() for p in (tmp_path / "agent-plugin/agents").glob("*.md"))
+    assert 'tools: [view_file]' in (tmp_path / "agent-plugin/agents/hermes.md").read_text()

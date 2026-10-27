@@ -10,7 +10,11 @@ It NEVER touches the live server. By design it sets ``AGI_PORT`` (not just
 ``--port``) so the per-conversation MCP bridge URL the spawned ``agy`` is told
 to dial back self-matches the throwaway port — otherwise tool turns would report
 "no tools" (see the gateway skill's pitfall). The launched server is killed by
-PID on exit.
+PID on exit. It also gets its OWN managed agent plugin
+(``~/.gemini/config/plugins/hermes-bridge-bench-<port>`` with agent
+``hermes-bench-<port>``, removed on exit): sharing the live server's
+``hermes.md`` would serialize the two servers' spawns on one file lock, and
+two plugins defining the same agent name would make ``--agent`` ambiguous.
 
 Scenarios (each repeated ``--iters`` times):
   * autonomous  — a short no-tool prompt (the autonomous path)
@@ -27,6 +31,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -83,6 +88,7 @@ class ServerHandle:
         self.http = http
         self.model = model
         self.proc: subprocess.Popen | None = None
+        self.plugin_path = Path(f"~/.gemini/config/plugins/hermes-bridge-bench-{port}").expanduser()
         self.lines: list[str] = []
         self._reader: threading.Thread | None = None
 
@@ -93,6 +99,8 @@ class ServerHandle:
         env["AGI_TIMING_LOG"] = "1"
         if self.model:
             env["AGI_DEFAULT_MODEL"] = self.model
+        env["AGI_AGENT_PLUGIN_PATH"] = str(self.plugin_path)
+        env["AGI_AGENT_NAME"] = f"hermes-bench-{self.port}"
         argv = [
             sys.executable, "-m", "uvicorn", "app.main:app",
             "--host", "127.0.0.1", "--port", str(self.port),
@@ -165,6 +173,8 @@ class ServerHandle:
             except subprocess.TimeoutExpired:
                 self.proc.kill()
                 self.proc.wait()
+        # Every agy on this host loads every plugin dir: do not leave ours.
+        shutil.rmtree(self.plugin_path, ignore_errors=True)
 
 
 def _post(base: str, payload: dict) -> dict:

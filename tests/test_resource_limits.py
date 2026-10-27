@@ -147,7 +147,10 @@ def test_symlink_attachment_directory_rejected(settings, tmp_path):
     target = tmp_path/'foreign'
     target.mkdir()
     settings.default_workdir.mkdir()
-    (settings.default_workdir/'attachments').symlink_to(target, target_is_directory=True)
+    try:
+        (settings.default_workdir/'attachments').symlink_to(target, target_is_directory=True)
+    except OSError as exc:  # Windows without Developer Mode / SeCreateSymbolicLink
+        pytest.skip(f'cannot create symlinks here: {exc}')
     store = AttachmentStore(settings)
     with pytest.raises(OpenAIError):
         store.pin_and_write(settings.default_workdir, {'img-'+'a'*16+'.png':b'123'})
@@ -206,8 +209,11 @@ async def test_none_uses_plain_route(application, fake_agy):
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=application), base_url='http://audit') as client:
         result = await client.post('/v1/chat/completions', json=request(tools=[{'function':{'name':'foo'}}], tool_choice='none').model_dump())
     assert result.status_code == 200, result.text
-    assert not application.state.conv_manager._conversations
+    # Plain turn: parked for reuse WITHOUT an MCP server / bridge registration.
+    convs = list(application.state.conv_manager._conversations.values())
+    assert [(c.state, c.slot) for c in convs] == [('idle', None)]
     assert not application.state.mcp._registry
+    await application.state.conv_manager.close_all()
 
 
 async def test_readiness_is_not_fabricated(application):
@@ -228,25 +234,3 @@ async def test_invalid_tool_schema_is_http_400_without_acquisition(application):
     assert application.state.admission.active == 0
     assert not application.state.mcp._registry
     assert not application.state.settings.default_workdir.exists()
-
-
-async def test_mcp_lock_wait_has_deadline(tmp_path):
-    import fcntl
-    from app.mcp_config import McpConfigManager
-    path = tmp_path/'isolated-mcp.json'
-    manager = McpConfigManager(path)
-    manager.lock_timeout_s = .03
-    fd = os.open(str(path)+'.lock', os.O_CREAT | os.O_RDWR, 0o600)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        task = asyncio.create_task(manager.add_conversation('test', 'http://127.0.0.1:1/mcp/test'))
-        done, _ = await asyncio.wait({task}, timeout=.2)
-        if not done:
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
-        assert done, 'shielded config acquisition must not hang cleanup forever'
-        with pytest.raises(TimeoutError):
-            task.result()
-        assert not manager._owned and not path.exists()
-    finally:
-        os.close(fd)

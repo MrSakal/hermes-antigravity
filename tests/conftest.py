@@ -14,6 +14,14 @@ from app.agy_session import AgySession  # noqa: E402
 FAKE_AGY = str(Path(__file__).with_name("fake_agy.py"))
 
 
+@pytest.fixture(autouse=True)
+def _no_warm_pool_by_default(monkeypatch):
+    """The production default is a 1-process warm pool; unit tests opt in
+    explicitly (``warm_pool_size=1``) so background boots never race the
+    process accounting other tests assert on."""
+    monkeypatch.setenv("AGI_WARM_POOL_SIZE", "0")
+
+
 @pytest.fixture
 def fake_agy(monkeypatch):
     """Route AgySession spawns to tests/fake_agy.py.
@@ -51,3 +59,37 @@ def fake_agy_bin(tmp_path) -> str:
         wrapper.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{FAKE_AGY}" "$@"\n')
         wrapper.chmod(wrapper.stat().st_mode | stat.S_IXUSR)
     return str(wrapper)
+
+
+def pid_alive(pid: int) -> bool:
+    """True while ``pid`` is a live (non-zombie) process — portable, and safe:
+    on Windows ``os.kill(pid, 0)`` would TerminateProcess it."""
+    if os.name == "nt":
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.OpenProcess(0x1000, False, pid)  # QUERY_LIMITED_INFORMATION
+        if not handle:
+            return False
+        try:
+            code = ctypes.c_ulong()
+            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return False
+            return code.value == 259  # STILL_ACTIVE
+        finally:
+            kernel32.CloseHandle(handle)
+    stat = Path(f"/proc/{pid}/stat")
+    try:
+        return stat.read_text().split()[2] != "Z"
+    except (FileNotFoundError, ProcessLookupError, IndexError):
+        return False
+
+
+def kill_pid(pid: int) -> None:
+    """Best-effort fixture cleanup of a leaked test child."""
+    import signal
+
+    try:
+        os.kill(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
+    except OSError:
+        pass

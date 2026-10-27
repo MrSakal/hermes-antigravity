@@ -11,60 +11,67 @@ def make_settings(**kw) -> Settings:
 
 def test_display_name_passthrough_case_insensitive():
     s = make_settings()
-    assert resolve_model("Gemini 3.7 Flash (Low)", s) == "Gemini 3.7 Flash (Low)"
-    assert resolve_model("gemini 3.7 flash (low)", s) == "Gemini 3.7 Flash (Low)"
-    assert resolve_model("claude sonnet 4.6 (thinking)", s) == "Claude Sonnet 4.6 (Thinking)"
+    assert resolve_model("Gemini 3.8 Flash (Low)", s) == "Gemini 3.8 Flash (Low)"
+    assert resolve_model("gemini 3.8 flash (low)", s) == "Gemini 3.8 Flash (Low)"
+    assert resolve_model("claude sonnet 5.5 (high)", s) == "Claude Sonnet 5.5 (High)"
+
+
+def test_static_table_is_the_agy_148_lineup():
+    from app.config import KNOWN_MODELS
+    assert KNOWN_MODELS == [
+        "Gemini 4 Argon (Medium)", "Gemini 4 Argon (High)", "Gemini 4 Argon (Low)",
+        "Gemini 3.8 Flash (High)", "Gemini 3.8 Flash (Medium)", "Gemini 3.8 Flash (Low)",
+        "Claude Opus 5.5 (Low)", "Claude Opus 5.5 (Medium)", "Claude Opus 5.5 (High)",
+        "Claude Sonnet 5.5 (Low)", "Claude Sonnet 5.5 (Medium)", "Claude Sonnet 5.5 (High)",
+        "GPT-OSS 120B (Medium)",
+    ]
 
 
 def test_slug_with_effort_param():
     s = make_settings()
     assert resolve_model("gemini-3.8-flash", s) == "Gemini 3.8 Flash (Medium)"
     assert resolve_model("gemini-3.8-flash", s, effort="high") == "Gemini 3.8 Flash (High)"
-    assert resolve_model("gemini-3.7-flash", s, effort="low") == "Gemini 3.7 Flash (Low)"
+    assert resolve_model("gemini-4-argon", s, effort="low") == "Gemini 4 Argon (Low)"
     assert resolve_model("flash", s) == "Gemini 3.8 Flash (Medium)"
-    assert resolve_model("gemini-3.6-flash", s) == "Gemini 3.6 Flash (Medium)"
+    assert resolve_model("argon", s) == "Gemini 4 Argon (Medium)"
 
 
 def test_slug_effort_suffix_overrides():
     s = make_settings()
-    assert resolve_model("gemini-3.7-flash-low", s, effort="high") == "Gemini 3.7 Flash (Low)"
-    assert resolve_model("gemini-3.1-pro-high", s) == "Gemini 3.1 Pro (High)"
+    assert resolve_model("gemini-4-argon-low", s, effort="high") == "Gemini 4 Argon (Low)"
+    assert resolve_model("claude-opus-5-5-high", s) == "Claude Opus 5.5 (High)"
 
 
 def test_retired_model_is_unknown():
-    """Gemini 3.5 was dropped by agy 1.1.27 — it must not silently resolve."""
+    """Gemini 3.5 / 3.7 / 3.1 Pro and Claude 4.6 are gone on 1.4.8 — they must
+    not silently resolve."""
     s = make_settings()
-    with pytest.raises(UnknownModel):
-        resolve_model("gemini-3.5-flash", s)
+    for gone in ("gemini-3.5-flash", "gemini-3.7-flash", "gemini-3.1-pro", "claude-opus-4-6-thinking"):
+        with pytest.raises(UnknownModel):
+            resolve_model(gone, s)
 
 
-def test_pro_family_without_medium():
+def test_family_aliases_follow_the_lineup():
     s = make_settings()
-    # No medium variant: effortless request prefers high, then low.
-    assert resolve_model("gemini-3.1-pro", s) == "Gemini 3.1 Pro (High)"
-    assert resolve_model("gemini-3.1-pro", s, effort="low") == "Gemini 3.1 Pro (Low)"
-
-
-def test_single_variant_families_ignore_effort():
-    s = make_settings()
-    assert resolve_model("claude-sonnet-4.6", s, effort="low") == "Claude Sonnet 4.6 (Thinking)"
-    assert resolve_model("opus", s) == "Claude Opus 4.6 (Thinking)"
+    assert resolve_model("sonnet", s, effort="low") == "Claude Sonnet 5.5 (Low)"
+    assert resolve_model("opus", s) == "Claude Opus 5.5 (Medium)"
+    assert resolve_model("claude", s, effort="high") == "Claude Opus 5.5 (High)"
     assert resolve_model("gpt-oss", s) == "GPT-OSS 120B (Medium)"
     assert resolve_model("gpt-oss-120b", s, effort="high") == "GPT-OSS 120B (Medium)"
 
 
 def test_agy_native_slugs_accepted():
-    """`agy models` spells single-variant slugs with dashes + suffixes."""
+    """`agy models` slugs (column 1) resolve to their display names."""
     s = make_settings()
-    assert resolve_model("claude-sonnet-4-6", s) == "Claude Sonnet 4.6 (Thinking)"
-    assert resolve_model("claude-opus-4-6-thinking", s) == "Claude Opus 4.6 (Thinking)"
+    assert resolve_model("claude-sonnet-5-5-medium", s) == "Claude Sonnet 5.5 (Medium)"
+    assert resolve_model("gemini-3.8-flash-low", s) == "Gemini 3.8 Flash (Low)"
     assert resolve_model("gpt-oss-120b-medium", s) == "GPT-OSS 120B (Medium)"
 
 
 def test_empty_falls_back_to_default():
-    s = make_settings(default_model="Gemini 3.7 Flash (High)")
-    assert resolve_model(None, s) == "Gemini 3.7 Flash (High)"
-    assert resolve_model("", s) == "Gemini 3.7 Flash (High)"
+    s = make_settings(default_model="Gemini 4 Argon (High)")
+    assert resolve_model(None, s) == "Gemini 4 Argon (High)"
+    assert resolve_model("", s) == "Gemini 4 Argon (High)"
 
 
 def test_unknown_is_rejected_in_strict_mode():
@@ -75,8 +82,8 @@ def test_unknown_is_rejected_in_strict_mode():
 
 
 def test_unknown_falls_back_when_not_strict():
-    s = make_settings(default_model="Gemini 3.7 Flash (High)", strict_model=False)
-    assert resolve_model("gpt-4o", s) == "Gemini 3.7 Flash (High)"
+    s = make_settings(default_model="Gemini 4 Argon (High)", strict_model=False)
+    assert resolve_model("gpt-4o", s) == "Gemini 4 Argon (High)"
 
 
 def test_live_catalog_replaces_static_tables():
@@ -130,3 +137,32 @@ def test_workdir_guard(tmp_path):
         pass
     else:  # pragma: no cover
         raise AssertionError("expected ValueError for out-of-root workdir")
+
+
+def test_aliases_follow_current_families_of_live_catalog():
+    """agy 1.4.8 lineup: fixed alias targets (claude-sonnet-4-6, gemini-3.1-pro)
+    are gone, so short aliases fall back to keyword matching; display family
+    names and family slugs resolve too. Unknown ids stay strict."""
+    from app.config import UnknownModel, resolve_model
+    from app.model_catalog import ModelCatalog, parse_models_output
+
+    cat = ModelCatalog("unused")
+    cat._entries = parse_models_output(
+        "gemini-4-argon-medium\tGemini 4 Argon (Medium)\n"
+        "gemini-4-argon-low\tGemini 4 Argon (Low)\n"
+        "gemini-3.8-flash-low\tGemini 3.8 Flash (Low)\n"
+        "claude-sonnet-5-5-medium\tClaude Sonnet 5.5 (Medium)\n"
+        "claude-opus-5-5-high\tClaude Opus 5.5 (High)\n")
+    kw = {"known_models": cat.display_names(), "families": cat.families()}
+    s = Settings(_env_file=None)
+    assert resolve_model("argon", s, "low", **kw) == "Gemini 4 Argon (Low)"
+    assert resolve_model("gemini", s, **kw) == "Gemini 4 Argon (Medium)"
+    assert resolve_model("Gemini 4 Argon", s, **kw) == "Gemini 4 Argon (Medium)"
+    assert resolve_model("gemini-4-argon-low", s, **kw) == "Gemini 4 Argon (Low)"
+    assert resolve_model("sonnet", s, **kw) == "Claude Sonnet 5.5 (Medium)"
+    assert resolve_model("claude", s, **kw) == "Claude Opus 5.5 (High)"
+    assert resolve_model("flash", s, **kw) == "Gemini 3.8 Flash (Low)"
+    with pytest.raises(UnknownModel):
+        resolve_model("pro", s, **kw)
+    with pytest.raises(UnknownModel):
+        resolve_model("no-such-model", s, **kw)

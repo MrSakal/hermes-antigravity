@@ -5,13 +5,14 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
+from app.agent_config import AgentPluginManager
 from app.agy_session import AgySession, STREAM_CLOSED
 from app.config import Settings
 from app.conversation import (Conversation, ConversationManager, DoneChunk, ErrorChunk,
                               ExpiredContinuation, SUSPENDED, TextChunk, ToolCallsChunk)
 from app.events import TextDelta, TurnDone
 from app.mcp_bridge import ConversationBridge, McpBridge, ToolResultError
-from app.mcp_config import McpConfigManager
+from app.errors import OpenAIError
 from app.openai_models import ChatCompletionRequest, ToolDef
 
 
@@ -22,16 +23,30 @@ TOOLS = [ToolDef(function={'name': 'allowed', 'parameters': {
 
 
 class Session:
+    """Event-stream double; bridge calls arrive through ``inject`` like the
+    real AgySession (one stream for the turn loop)."""
+
     def __init__(self, events=(), delay=0):
         self.events = list(events)
         self.delay = delay
         self.aclose = AsyncMock()
+        self._wake = asyncio.Event()
+
+    def inject(self, item):
+        self.events.append(item)
+        self._wake.set()
 
     async def next_event(self, timeout=None):
-        if self.events:
-            await asyncio.sleep(self.delay)
-            return self.events.pop(0)
-        await asyncio.Event().wait()
+        # Honors ``timeout`` like AgySession.next_event, delay included.
+        try:
+            async with asyncio.timeout(timeout):
+                while not self.events:
+                    self._wake.clear()
+                    await self._wake.wait()
+                await asyncio.sleep(self.delay)
+        except TimeoutError:
+            return None
+        return self.events.pop(0)
 
     def push_back(self, event):
         self.events.insert(0, event)
@@ -39,10 +54,10 @@ class Session:
 
 @pytest.fixture
 def manager(tmp_path):
-    return ConversationManager(McpBridge(), McpConfigManager(tmp_path / 'mcp.json'), Settings(
+    return ConversationManager(McpBridge(), Settings(
         _env_file=None, default_workdir=tmp_path, mcp_config_path=tmp_path / 'mcp.json',
         agy_brain_path=tmp_path / 'brain', request_timeout_s=1,
-    ))
+    ), agents=AgentPluginManager(tmp_path / 'plugin'))
 
 
 def conversation(manager, name='a', events=(), delay=0):
@@ -158,7 +173,7 @@ async def test_resources_held_suspended_and_released_once_on_failed_close(manage
     conv, tasks, _ = await suspend(manager)
     release = conv.release_resources = Mock()
     release.assert_not_called()
-    manager.mcp_config.remove_conversation = AsyncMock(side_effect=OSError('disk'))
+    manager.mcp.close_conversation = AsyncMock(side_effect=OSError('disk'))
     conv.session.aclose = AsyncMock(side_effect=RuntimeError('process'))
     for _ in range(2):
         with pytest.raises(RuntimeError, match='process'):
@@ -190,9 +205,9 @@ async def test_concurrent_close_keeps_resources_until_process_closed(manager):
 
 
 @pytest.mark.parametrize('failure', [OSError('disk'), asyncio.CancelledError()])
-async def test_config_failure_unregisters(manager, failure):
-    manager.mcp_config.add_conversation = AsyncMock(side_effect=failure)
-    with pytest.raises(type(failure)):
+async def test_agent_file_failure_unregisters(manager, failure):
+    manager.agents._write_if_changed = Mock(side_effect=failure)
+    with pytest.raises(OpenAIError if isinstance(failure, OSError) else type(failure)):
         await manager.create(ChatCompletionRequest(messages=[{'role': 'user', 'content': 'go'}]),
                              model='model', workdir=manager.settings.default_workdir)
     assert not manager.mcp._registry and not manager._conversations
@@ -207,19 +222,18 @@ async def test_start_failure_rolls_back_real_config(manager, monkeypatch, failur
         await manager.create(ChatCompletionRequest(messages=[{'role': 'user', 'content': 'go'}]),
                              model='model', workdir=manager.settings.default_workdir)
     assert not manager.mcp._registry and not manager._conversations
-    assert not manager.mcp_config._owned
-    closed.assert_awaited_once()
+    assert not (manager.settings.default_workdir / 'mcp.json').exists()
+    closed.assert_awaited()
 
 
-async def test_cancellation_during_slot_allocation_rolls_back(manager):
-    original = manager.mcp_config.add_conversation
+async def test_cancellation_during_spawn_rolls_back(manager):
+    original = manager.agents.spawn
     entered, finish = asyncio.Event(), asyncio.Event()
-    async def allocate(*args):
-        slot = await original(*args)
+    async def spawn(session, content, **kw):
         entered.set()
         await finish.wait()
-        return slot
-    manager.mcp_config.add_conversation = allocate
+        return await original(session, content, **kw)
+    manager.agents.spawn = spawn
     task = asyncio.create_task(manager.create(ChatCompletionRequest(messages=[{'role': 'user', 'content': 'go'}]),
                               model='model', workdir=manager.settings.default_workdir))
     await entered.wait()
@@ -229,4 +243,4 @@ async def test_cancellation_during_slot_allocation_rolls_back(manager):
     finish.set()
     with pytest.raises(asyncio.CancelledError):
         await task
-    assert not manager.mcp._registry and not manager.mcp_config._owned
+    assert not manager.mcp._registry and not manager._conversations

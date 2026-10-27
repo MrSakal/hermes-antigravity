@@ -3,19 +3,20 @@
 
 Stands up a real in-process MCP server (one tool `get_weather`, NON-suspending —
 returns canned JSON immediately) mounted at /mcp/<conv_id> via a single global
-StreamableHTTPSessionManager, registers a `hermes*` slot for it in the shared
-Antigravity MCP config (the ONLY file agy honors — no --mcp-config flag), then
-launches `agy` and asks it to use the tool.
+StreamableHTTPSessionManager, declares it as the only MCP server of the managed
+agent file (``inheritMcp: false`` + ``mcpServers``, see app/agent_config.py —
+agy has no --mcp-config flag), then launches `agy --agent hermes` and asks it to
+use the tool.
 
 Confirms:
   #1  the tool call arrives at our handler via agy's generic `call_mcp_tool`
       builtin (ServerName=<slot>, ToolName=get_weather) with no permission stop
       under --dangerously-skip-permissions
-  #2  the serverUrl registration in ~/.gemini/config/mcp_config.json is picked
-      up at conversation start
+  #2  the agent-file mcpServers entry is picked up at boot (the shared
+      ~/.gemini/config/mcp_config.json is never written)
   #3  /mcp/<conv_id> routing through one mounted manager works
 
-The config slot is removed on exit (foreign entries untouched).
+The managed agent file is left in place (the server rewrites it per spawn).
 
 Env knobs:
   PROBE_PORT=8799
@@ -38,7 +39,7 @@ from starlette.routing import Mount
 
 from app.agy_session import STREAM_CLOSED, AgySession
 from app.events import Error, Init, TextDelta, ToolStep, TurnDone
-from app.mcp_config import McpConfigManager
+from app.agent_config import AgentPluginManager, McpServerSpec, render_agent
 
 PORT = int(os.environ.get("PROBE_PORT", "8799"))
 CONV_ID = "probeconv"
@@ -126,7 +127,8 @@ async def drive_agy(slot: str) -> bool:
             "for Paris, then tell me the result in one sentence."
         ),
     )
-    await sess.start()
+    md = render_agent(None, servers=[McpServerSpec(slot, f"http://127.0.0.1:{PORT}/mcp/{CONV_ID}")])
+    await AgentPluginManager().spawn(sess, md)
     saw_slot_toolstep = False
     final_text = ""
     done: TurnDone | None = None
@@ -182,16 +184,10 @@ async def main() -> int:
         await asyncio.sleep(0.05)
     print(f"[probe] MCP server up on :{PORT}", flush=True)
 
-    mcp_config = McpConfigManager()
-    slot = await mcp_config.add_conversation(
-        CONV_ID, f"http://127.0.0.1:{PORT}/mcp/{CONV_ID}"
-    )
-    print(f"[probe] registered MCP config slot {slot!r} in {mcp_config.path}", flush=True)
+    slot = "hermes-probe"
     try:
         ok = await drive_agy(slot)
     finally:
-        await mcp_config.remove_conversation(slot)
-        print(f"[probe] removed MCP config slot {slot!r}", flush=True)
         server_obj.should_exit = True
         with contextlib.suppress(Exception):
             await asyncio.wait_for(serve_task, timeout=5)

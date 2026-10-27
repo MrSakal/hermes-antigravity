@@ -24,7 +24,7 @@ def test_api_tags():
 
 
 def test_api_show_known_model():
-    r = client.post("/api/show", json={"model": "gemini-3.7-flash"})
+    r = client.post("/api/show", json={"model": "gemini-3.8-flash"})
     assert r.status_code == 200
     body = r.json()
     for key in ("details", "model_info", "capabilities"):

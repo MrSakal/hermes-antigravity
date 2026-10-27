@@ -7,8 +7,9 @@ Type=oneshot
 WorkingDirectory=/home/hermes/hermes-antigravity
 Environment=HOME=/home/hermes
 ExecStart=/home/hermes/hermes-antigravity/.venv/bin/python scripts/prune_agy_state.py --keep-days 7 --checkpoint --json
-# Exit 2 = an agy turn is live right now; the timer simply retries next run.
-SuccessExitStatus=2
+# Prunes while the server's persistent agy processes run: conversations a live
+# process references (--conversation <id>) or touched within --keep-days are
+# skipped. Exit 2 = live processes cannot be listed (no /proc) - a real failure.
 Nice=10
 IOSchedulingClass=idle
 UMask=0077

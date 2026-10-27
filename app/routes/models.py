@@ -2,7 +2,12 @@
 
 The list comes from the live catalog (``agy models``, see
 :mod:`app.model_catalog`) when it has loaded, else from the static fallback
-table. Discovery lists one CLI slug per variant; aliases remain valid inputs.
+table. It advertises every id a client can send, in this order: one CLI slug
+per variant (agy's own order, so a client picking the first id gets a slug),
+then the family slugs of multi-variant models (``gemini-4-argon``, effort
+picked by ``effort``/``reasoning_effort``), then the display names agy itself
+prints (``Gemini 4 Argon (Medium)``). Short aliases (``argon``, ``flash``, …)
+remain valid inputs without being listed.
 """
 
 from __future__ import annotations
@@ -23,7 +28,13 @@ def _static_ids() -> list[str]:
 
 def model_ids(request: Request) -> list[str]:
     catalog = getattr(request.app.state, "model_catalog", None)
-    return list(dict.fromkeys(catalog.slugs())) if catalog is not None and catalog.loaded else _static_ids()
+    if catalog is not None and catalog.loaded:
+        slugs, families, displays = catalog.slugs(), catalog.families(), catalog.display_names()
+    else:
+        slugs, families = _static_ids(), _FAMILY_VARIANTS
+        displays = [d for variants in families.values() for d in variants.values()]
+    multi = [family for family, variants in families.items() if "" not in variants]
+    return list(dict.fromkeys([*slugs, *multi, *displays]))
 
 
 def known_model(model_id: str, request: Request) -> bool:

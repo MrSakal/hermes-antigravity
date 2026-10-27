@@ -38,15 +38,36 @@ async def metrics(request: Request):
     data = state.metrics.snapshot()
     mgr = state.conv_manager
     conversations = list(mgr._conversations.values()) if mgr else []
+    stats = mgr.stats if mgr else {}
+    pool = state.warm_pool
     data.update(sessions_active=state.admission.active,
                 sessions_capacity=state.admission.limit,
                 sessions_waiting=state.admission.waiting,
                 sessions_suspended=sum(c.state == 'suspended' for c in conversations),
-                tool_stdout_queue_depth=sum(c.session._queue.qsize() for c in conversations),
+                # Live agy processes owned by conversations (busy + parked
+                # IDLE; max_sessions caps this by LRU-evicting IDLE ones) and
+                # the warm pool on top.
+                processes_live=mgr.count() if mgr else 0,
+                processes_idle=sum(c.state == 'idle' for c in conversations),
+                processes_running=sum(c.state == 'running' for c in conversations),
+                processes_total=(mgr.count() if mgr else 0) + pool.idle,
+                dormant_conversations=len(mgr._dormant) if mgr else 0,
+                reuse_hits=stats.get('reuse_hits', 0),
+                reuse_misses=stats.get('reuse_misses', 0),
+                dormant_resumes=stats.get('dormant_resumes', 0),
+                dormant_lost=stats.get('dormant_lost', 0),
+                idle_evictions=stats.get('evictions', 0),
+                duplicate_continuations=stats.get('duplicates_rejected', 0),
+                tool_stdout_queue_depth=sum(c.session._queue.qsize() for c in conversations
+                                            if hasattr(c.session, '_queue')),
                 mcp_transport_sessions=len(state.mcp.session_manager._server_instances),
-                warm_pool_idle=state.warm_pool.idle,
-                warm_pool_hits=state.warm_pool.hits,
-                warm_pool_misses=state.warm_pool.misses,
+                warm_pool_size=pool.size,
+                warm_pool_idle=pool.idle,
+                warm_pool_hits=pool.hits,
+                warm_pool_tool_hits=pool.tool_hits,
+                warm_pool_misses=pool.misses,
+                warm_pool_spawn_failures=pool.spawn_failures,
+                warm_pool_targets=len(pool._targets),
                 attachment_workspaces_pinned=len(state.attachments.pins))
     return data
 

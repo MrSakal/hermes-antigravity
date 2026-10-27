@@ -3,10 +3,11 @@
 The app exposes an OpenAI-compatible surface (``/v1/models``,
 ``/v1/chat/completions``) backed by the Antigravity CLI (`agy`), and mounts the
 in-process MCP bridge at ``/mcp`` so agy can reach hermes' functions. Each
-tool-turn conversation registers its own entry in the shared Antigravity MCP
-config pointing at ``/mcp/<conv_id>`` (see :mod:`app.mcp_config`). The lifespan
-hook owns the MCP session manager's task group, the ConversationManager + GC
-loop, and stale-slot cleanup.
+tool-turn conversation declares its server (``/mcp/<conv_id>``) in the managed
+agent file it boots with (see :mod:`app.agent_config`); the shared Antigravity
+MCP config is never written. The lifespan hook owns the MCP session manager's
+task group, the ConversationManager + GC loop, and the one-time migration of
+older builds' leftovers (legacy per-prompt agent files, shared-config slots).
 """
 
 from __future__ import annotations
@@ -22,11 +23,10 @@ from fastapi import FastAPI, Request
 
 from app.agent_config import AgentPluginManager
 from app.config import KNOWN_MODELS, get_settings
-from app.convcache import ConversationCache
 from app.conversation import ConversationManager
 from app.errors import OpenAIError
 from app.mcp_bridge import McpBridge
-from app.mcp_config import McpConfigManager
+from app.mcp_config import cleanup_legacy_mcp_entries
 from app.model_catalog import ModelCatalog
 from app.resources import Admission, AttachmentStore, Metrics
 from app.request_guard import RequestGuard
@@ -59,12 +59,15 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         catalog_task = asyncio.create_task(catalog.refresh_loop(), name="agi-model-catalog")
     pool: WarmPool = app.state.warm_pool
     pool_task = asyncio.create_task(_pool_gc_loop(pool, settings.gc_interval_s), name="agi-warmpool-gc") if pool.enabled else None
+    # Migration from older builds: per-prompt agent files and hermes/hermesN
+    # slots they left in the shared MCP config (backed up once; never ours to
+    # write again).
+    app.state.agent_plugin.cleanup_legacy()
+    if settings.manage_mcp_config:
+        await asyncio.to_thread(cleanup_legacy_mcp_entries, settings.mcp_config_path)
     async with mcp.lifespan():
-        manager: ConversationManager | None = app.state.conv_manager
-        gc_task = None
-        if manager is not None:
-            await manager.mcp_config.cleanup_stale(settings.port)
-            gc_task = asyncio.create_task(manager.gc_loop(), name="agi-gc")
+        manager: ConversationManager = app.state.conv_manager
+        gc_task = asyncio.create_task(manager.gc_loop(), name="agi-gc")
         try:
             yield
         finally:
@@ -74,9 +77,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                     with contextlib.suppress(asyncio.CancelledError):
                         await task
             await pool.stop()
-            if manager is not None:
-                await manager.close_all()
-                await manager.mcp_config.remove_all()
+            await manager.close_all()
             logger.info("antigravity-interface shutting down")
 
 
@@ -108,27 +109,23 @@ def create_app() -> FastAPI:
     app.state.admission = Admission(settings.max_sessions, settings.max_queued_requests,
                                     settings.admission_timeout_s, app.state.metrics)
     app.state.attachments = AttachmentStore(settings)
-    app.state.warm_pool = WarmPool(settings, settings.warm_pool_size,
-                                   max_idle_s=settings.warm_pool_max_idle_s)
-    app.state.mcp = mcp
-    app.state.conv_cache = ConversationCache(
-        max_entries=settings.conversation_cache_max,
-        ttl_s=settings.conversation_cache_ttl_s,
+    agent_plugin = AgentPluginManager(
+        settings.agent_plugin_path, start_timeout_s=settings.agent_start_timeout_s,
+        agent_name=settings.agent_name,
     )
+    app.state.agent_plugin = agent_plugin
+    manager = ConversationManager(mcp, settings, agents=agent_plugin)
+    # Pooled entries pre-mint their conv_id and bake /mcp/<conv_id> into the
+    # agent file, so the pool shares the manager's MCP bridge and URL scheme.
+    manager.pool = WarmPool(settings, settings.warm_pool_size,
+                            max_idle_s=settings.warm_pool_max_idle_s,
+                            agents=agent_plugin, mcp=mcp, mcp_url=manager._mcp_url)
+    app.state.warm_pool = manager.pool
+    app.state.mcp = mcp
     app.state.model_catalog = ModelCatalog(
         settings.agy_bin, refresh_interval_s=settings.model_catalog_refresh_s
     )
-    agent_plugin = AgentPluginManager(
-        settings.agent_plugin_path, max_agents=settings.agent_cache_max
-    )
-    app.state.agent_plugin = agent_plugin
-    if settings.manage_mcp_config:
-        mcp_config = McpConfigManager(settings.mcp_config_path)
-        app.state.conv_manager = ConversationManager(
-            mcp, mcp_config, settings, agents=agent_plugin
-        )
-    else:
-        app.state.conv_manager = None
+    app.state.conv_manager = manager
 
     @app.exception_handler(OpenAIError)
     async def _openai_error_handler(_: Request, exc: OpenAIError):  # type: ignore[unused-ignore]

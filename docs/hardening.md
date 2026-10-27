@@ -35,7 +35,10 @@ See `.env.example` for all defaults:
 
 | Setting | Default | Meaning |
 |---|---:|---|
-| `AGI_MAX_SESSIONS` | 8 | Allocated subprocess sessions, including suspended turns |
+| `AGI_MAX_SESSIONS` | 8 | Allocated turn permits (incl. suspended turns); also the cap on live conversation processes (IDLE ones LRU-evicted) |
+| `AGI_WARM_POOL_SIZE` | 2 | Pre-booted procs on top of `AGI_MAX_SESSIONS` (≈200 MB each; 0 = off) |
+| `AGI_WARM_POOL_SIGNATURES` | 2 | Distinct signatures kept warm at once (size is split across them) |
+| `AGI_AGENT_START_TIMEOUT_S` | 30 | Per-spawn boot bound; also how long a hung agy blocks other spawns |
 | `AGI_MAX_SUSPENDED_SESSIONS` | 4 | Sessions waiting for client tool results |
 | `AGI_MAX_QUEUED_REQUESTS` | 16 | Maximum waiting session admissions |
 | `AGI_ADMISSION_TIMEOUT_S` | 5 | Maximum wait for a new session; overload returns 503 |
@@ -66,24 +69,67 @@ upstream error, including after partial text. SSE failures appear as OpenAI-shap
 
 ## Conversation and process ownership
 
-Cache fingerprints include structured message/image identity and the route's model,
-workspace and agent configuration namespace. A lookup claims its upstream conversation
-and removes stale aliases before resume; concurrent branches fall back to fresh
-conversations instead of driving one mutable conversation twice.
+Processes are persistent. After a clean answer a process is parked IDLE under
+`H(spawn signature, normalized history)`: the signature covers model, workspace,
+agent-file template digest (system prompt, builtin allowlist, MCP server name),
+toolset hash and a preamble-delivered system prompt; the history includes the
+assistant text exactly as returned (whitespace-stripped), list content (images)
+verbatim, and tool calls by id + name. A claim is atomic and single-use (IDLE →
+RUNNING under one lock; dormant records are popped), so concurrent branches fall
+back to fresh conversations instead of driving one mutable conversation twice.
+A turn abandoned mid-flight (disconnect, timeout, error) kills its process —
+agy has no per-turn cancel and its history would diverge from the client's — so
+only processes whose history equals what the client saw are ever parked.
 
-Each CLI subprocess owns a process group on POSIX. Cleanup targets that group rather
-than assuming terminating the immediate parent will terminate every child. Processes
-that deliberately escape into a new session are outside this mechanism; the service
-manager's cgroup remains useful defense in depth. Registry/config/process acquisition
-is rolled back on errors and cancellation.
+`AGI_MAX_SESSIONS` caps live conversation processes: IDLE ones are LRU-evicted
+(gracefully: stdin EOF, then kill after 2 s) and kept dormant. A dormant resume
+(`--conversation`) waits for the predecessor process to have fully exited
+(15 s, else it starts fresh), so two processes never write one agy
+conversation; if agy answers with a different conversation id (pruned DB) the
+resume is discarded before any message is sent and the history is refolded.
+Request-scoped cleanup is pinned to the turn it started (a turn token), so a
+late cleanup never kills the next turn a fast client already claimed; GC kills
+claimed-but-undriven turns after 30 s. Kills are issued synchronously
+(`killpg(SIGKILL)` / `taskkill /T /F` Popen) before any await, and the teardown
+runs shielded, so a second cancellation cannot leave a process alive.
 
-MCP configuration updates use cooperating interprocess locking and atomic replacement.
-Cleanup checks current ownership before deleting a slot. An IDE that ignores the lock
-can still race a shared-file read/modify/write; this is not a multi-writer transaction
-protocol for arbitrary third-party writers. Corrupt configuration is an error, not an
-invitation to overwrite it with an empty object. Lock acquisition has a five-second
-deadline, including during shielded rollback. The deployed locking implementation
-requires POSIX (`fcntl`); native Windows is not supported by this hardened release.
+A duplicate of a continuation whose tool results were already delivered (the
+tool loop finished) is answered 409 `tool_result_expired` from a bounded memory
+of completed `tool_call_id`s (`AGI_COMPLETED_CALL_MEMORY_MAX` / `_S`, default
+1024 / 600 s) — never rebuilt, which would re-run the turn. A continuation whose
+suspended process died is a plain expiry and is rebuilt (if enabled).
+
+Each CLI subprocess owns a process group on POSIX (`start_new_session`).
+Cleanup sends SIGTERM to that group, waits up to 5 s, then SIGKILLs the group —
+also when the leader already exited. Processes that deliberately escape into a
+new session are outside this mechanism; the service manager's cgroup remains
+useful defense in depth. On Windows there are no process groups: cleanup runs
+`taskkill /PID <pid> /T /F` (synchronous Popen, so a cancellation cannot
+interrupt it) while the leader is alive, then kills the leader if needed; a
+descendant whose leader already exited cannot be reached that way. The Windows
+path costs nothing on Linux (it is behind an `os.name` check). Registry and
+process acquisition is rolled back on errors and cancellation.
+
+The shared MCP configuration is not written during operation: each tool turn's
+MCP server is declared in the agent file it boots with (`inheritMcp: false`,
+one `mcpServers` entry). The managed agent file is a single path shared by all
+spawns; one in-process lock is held from its write until the spawned agy printed
+its first stdout line (agy reads the file before that line). A spawn that
+produces no output within `AGI_AGENT_START_TIMEOUT_S`, fails, or is cancelled is
+killed and reaped **before** the lock is released, so a slow agy can never read
+the next spawn's file. Writes are atomic (temp + replace, retried briefly on a
+Windows sharing violation). The same window is also held under an advisory OS
+file lock (`agents/.hermes.md.lock`; `flock` on POSIX, `msvcrt.locking` on
+Windows, polled with `asyncio.sleep`), so two servers sharing one plugin
+directory serialize too; still prefer one directory + agent name per server
+(`AGI_AGENT_PLUGIN_PATH` + `AGI_AGENT_NAME`, as `scripts/bench.py` does).
+Request-driven spawns take the lock before warm-pool refills; a request whose
+queue would outlast its deadline fails fast with 503 `spawn_queue_full`. An agy
+that exits before its first stdout line is a failed spawn (502
+`upstream_start_failed` with its stderr tail), never a live-looking dead
+process. The startup migration of older builds' shared-config slots only
+removes `hermes`/`hermesN` entries with a loopback `/mcp/conv<N>-<id>` URL,
+backs the original up once, and leaves an unparsable file untouched.
 
 Conversation teardown also terminates and evicts its MCP SDK transport sessions.
 This cleanup uses a small, HTTP-regression-tested adapter to private SDK maps;
@@ -133,8 +179,10 @@ Profiling after the lifecycle fixes showed agy's boot (~3.5 s exec→`init`) is
 the dominant, prompt-independent cost of a turn. `AGI_WARM_POOL_SIZE` pre-boots
 that many procs with the prompt deferred (`AgySession(prompt=None)` + `send()`;
 `--print-timeout` only starts counting at the prompt, verified). Only fresh
-autonomous turns adopt; the pool holds one signature (model, workdir, agent) and
-re-targets to traffic. Pooled procs are outside the admission count until
+autonomous turns adopt; the pool keeps the `AGI_WARM_POOL_SIGNATURES` hottest
+signatures over the last 16 fresh turns (seen at least twice, LRU among those;
+a seen-once signature only fills a free slot and never displaces a warm one), so
+alternating traffic does not thrash it. Failed pooled boots back off exponentially (1 s to 60 s). Pooled procs are outside the admission count until
 adopted, are recycled after `AGI_WARM_POOL_MAX_IDLE_S`, and are drained at
 shutdown. Disconnect cleanup of an adopted proc is covered by the live E2E,
 which asserts on `/metrics` (`sessions_active`, `warm_pool_idle`) rather than
@@ -155,6 +203,9 @@ The bridge never resumes a conversation older than `AGI_CONVERSATION_CACHE_TTL_S
 requested one and refolds the whole history on mismatch, so pruning agy's
 `conversations/` is safe for the bridge. `scripts/prune_agy_state.py` +
 `deploy/agy-prune.timer` implement that retention (default 7 days, WAL
-checkpoint of kept DBs). The script refuses to run while an `agy --print`
-process is live. Interactive agy sessions on the same host are not
+checkpoint of kept DBs, plus old `mcp/hermes-<8hex>/` schema caches). It runs
+alongside the always-on persistent processes: conversations a live process
+references (`--conversation <id>`, from `/proc` or the Windows command line) or
+touched within the keep window are skipped; it refuses (exit 2) only when it
+cannot list processes at all. Interactive agy sessions on the same host are not
 distinguishable from bridge turns; raise `--keep-days` if you rely on them.

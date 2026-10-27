@@ -145,6 +145,17 @@ def validate_request(req, settings) -> dict[str, bytes]:
     return images
 
 
+def _touch_nofollow(target: Path) -> None:
+    """Bump mtime (GC recency) without following a symlink planted at ``target``.
+
+    Windows has no ``lutimes`` (``follow_symlinks=False`` raises
+    NotImplementedError), so there the symlink check is explicit instead."""
+    if os.utime in os.supports_follow_symlinks:
+        os.utime(target, None, follow_symlinks=False)
+    elif not target.is_symlink():
+        os.utime(target, None)
+
+
 class AttachmentStore:
     """Quota per workspace; active/suspended requests pin the whole workspace.
 
@@ -223,7 +234,7 @@ class AttachmentStore:
                         os.replace(tmp, target)
                     finally:
                         Path(tmp).unlink(missing_ok=True)
-                os.utime(target, None, follow_symlinks=False)
+                _touch_nofollow(target)
         except BaseException:
             release()
             raise

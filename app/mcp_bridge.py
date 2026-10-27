@@ -42,7 +42,7 @@ from starlette.responses import JSONResponse
 from collections.abc import AsyncIterator
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import mcp.types as mtypes
 from mcp.server.lowlevel import Server
@@ -105,22 +105,37 @@ class ConversationBridge:
         if max_pending_tool_calls < 1:
             raise ValueError("max_pending_tool_calls must be positive")
         self.conv_id = conv_id
-        self.tools = copy.deepcopy(tools)
-        self.signature = tool_signature(self.tools)
-        self._validators = {}
-        for tool in self.tools:
-            fn = tool.function
-            if not fn.name or fn.name in self._validators:
-                raise ValueError("tool names must be nonempty and unique")
-            validator = validator_for(fn.parameters)
-            validator.check_schema(fn.parameters)
-            self._validators[fn.name] = validator(
-                fn.parameters, registry=Registry(retrieve=_no_remote_schema)
-            )
+        self.bind_tools(tools)
         self._limit = max_pending_tool_calls
         self._incoming: asyncio.Queue[PendingCall] = asyncio.Queue(maxsize=self._limit)
         self._pending: dict[str, PendingCall] = {}
         self._closed = False
+        # Where dispatched calls go: the owning AgySession's event stream (one
+        # queue for the turn loop), or this bridge's own queue when detached.
+        self._sink: Optional[Callable[[PendingCall], None]] = None
+
+    def bind_tools(self, tools: list[ToolDef]) -> None:
+        """(Re)bind the advertised toolset. Used at construction and to
+        late-bind a warm-pool conversation's tools before its first message —
+        agy only lists tools when it connects, at that first message."""
+        tools = copy.deepcopy(list(tools or []))
+        validators = {}
+        for tool in tools:
+            fn = tool.function
+            if not fn.name or fn.name in validators:
+                raise ValueError("tool names must be nonempty and unique")
+            validator = validator_for(fn.parameters)
+            validator.check_schema(fn.parameters)
+            validators[fn.name] = validator(
+                fn.parameters, registry=Registry(retrieve=_no_remote_schema)
+            )
+        self.tools = tools
+        self.signature = tool_signature(tools)
+        self._validators = validators
+
+    def attach(self, sink: Optional[Callable[["PendingCall"], None]]) -> None:
+        """Route dispatched calls into ``sink`` (the session's ``inject``)."""
+        self._sink = sink
 
     # ── advertised to Claude ────────────────────────────────────────────────
 
@@ -163,7 +178,10 @@ class ConversationBridge:
             future=loop.create_future(),
         )
         self._pending[call.id] = call
-        self._incoming.put_nowait(call)
+        if self._sink is not None:
+            self._sink(call)
+        else:
+            self._incoming.put_nowait(call)
         logger.debug("conv=%s dispatch %s id=%s — suspending", self.conv_id, name, call.id)
         try:
             return await call.future

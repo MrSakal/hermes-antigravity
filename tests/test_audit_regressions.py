@@ -3,27 +3,25 @@ All writes/processes are test fixtures under /tmp; no upstream model calls.
 Originally reproduced against 5cf6d78; all assertions must pass after remediation.
 """
 import asyncio
-import json
-import os
-import signal
 import sys
 import time
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import httpx
 import pytest
 
+from app.agent_config import AgentPluginManager
 from app.agy_session import AgySession, STREAM_CLOSED
 from app.config import Settings
-from app.convcache import ConversationCache, history_key
-from app.conversation import Conversation, ConversationManager, ErrorChunk
+from app.errors import OpenAIError
+from app.conversation import (Conversation, ConversationManager, DoneChunk, ErrorChunk,
+                              TextChunk, _Dormant, history_key)
 from app.events import TextDelta, TurnDone
 from app.mcp_bridge import ConversationBridge, McpBridge
-from app.mcp_config import McpConfigManager
 from app.openai_models import ChatCompletionRequest, ChatMessage, ToolDef
-from app.routes.chat import _stream
+from conftest import kill_pid, pid_alive
 
 
 def messages(image):
@@ -42,18 +40,22 @@ def test_changed_image_changes_cache_key():
             return struct.pack('>I',len(data))+kind+data+struct.pack('>I',zlib.crc32(kind+data))
         raw = b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR',struct.pack('>IIBBBBB',1,1,8,2,0,0,0)) + chunk(b'IDAT',zlib.compress(b'\x00'+pixel)) + chunk(b'IEND',b'')
         return 'data:image/png;base64,' + base64.b64encode(raw).decode()
-    assert history_key(messages(png(b'\xff\x00\x00'))) != history_key(messages(png(b'\x00\x00\xff')))
+    assert history_key('sig', messages(png(b'\xff\x00\x00'))) != history_key('sig', messages(png(b'\x00\x00\xff')))
 
 
-def test_old_prefix_does_not_resume_already_extended_conversation():
-    cache = ConversationCache()
-    first = [ChatMessage(role='user', content='root question')]
-    cache.store(first, 'root answer', 'fixture-conversation')
-    prefix = first + [ChatMessage(role='assistant', content='root answer')]
-    branch_a = prefix + [ChatMessage(role='user', content='branch A')]
-    cache.store(branch_a, 'answer A', 'fixture-conversation')
-    branch_b = prefix + [ChatMessage(role='user', content='branch B')]
-    assert cache.lookup(branch_b) is None, 'Old prefix still points to conversation already containing branch A'
+async def test_old_prefix_does_not_resume_already_extended_conversation(tmp_path):
+    """A dormant record is consumed by its first claim: a second branch off the
+    same prefix must miss instead of resuming a conversation that already
+    contains the first branch."""
+    mgr = manager(tmp_path)
+    gone = asyncio.Event()
+    gone.set()
+    prefix = [ChatMessage(role='user', content='root question'),
+              ChatMessage(role='assistant', content='root answer')]
+    key = history_key('sig', prefix)
+    mgr._dormant[key] = _Dormant('fixture-conversation', gone)
+    assert (await mgr._claim_idle(key))[1] is not None   # branch A resumes it
+    assert (await mgr._claim_idle(key))[1] is None, 'Old prefix still points to a conversation already containing branch A'
 
 
 class StubSession:
@@ -73,16 +75,18 @@ class StubSession:
         return 'fixture process terminated without result'
 
 
-async def test_stream_preserves_result_only_response():
-    req = ChatCompletionRequest(messages=[{'role':'user','content':'test'}])
+async def test_stream_preserves_result_only_response(tmp_path):
+    mgr = manager(tmp_path)
     sess = StubSession([TurnDone(response_text='AUDIT-RESULT-ONLY')])
-    wire = ''.join([part async for part in _stream(sess, ConversationCache(), req, 'fixture', 'model', 0, 1, False)])
-    assert 'AUDIT-RESULT-ONLY' in wire, wire
+    conv = Conversation('fixture', None, sess, ConversationBridge('fixture', []), 'model')
+    chunks = [ch async for ch in mgr.run_turn(conv)]
+    assert [c.text for c in chunks if isinstance(c, TextChunk)] == ['AUDIT-RESULT-ONLY']
+    assert isinstance(chunks[-1], DoneChunk)
 
 
 def manager(tmp_path):
     settings = Settings(_env_file=None, default_workdir=tmp_path, mcp_config_path=tmp_path/'mcp.json', request_timeout_s=1)
-    return ConversationManager(McpBridge(), McpConfigManager(settings.mcp_config_path), settings)
+    return ConversationManager(McpBridge(), settings, agents=AgentPluginManager(tmp_path/'plugin'))
 
 
 async def test_tool_eof_without_result_is_error(tmp_path):
@@ -124,23 +128,15 @@ async def test_mixed_continuation_does_not_consume_other_conversation_ids(tmp_pa
     assert rejected and mgr._pending_index.get('call_B') == 'B', f'rejected={rejected}; remaining_index={mgr._pending_index}'
 
 
-async def test_config_add_failure_rolls_back_bridge_registration(tmp_path):
+async def test_agent_write_failure_rolls_back_bridge_registration(tmp_path):
     mgr = manager(tmp_path)
-    mgr.mcp_config.add_conversation = AsyncMock(side_effect=OSError('fixture disk failure'))
+    mgr.agents._write_atomic = Mock(side_effect=OSError('fixture disk failure'))
+    mgr.agents._ensure_plugin = Mock()
     req = ChatCompletionRequest(messages=[{'role':'user','content':'test'}])
-    with pytest.raises(OSError):
+    with pytest.raises(OpenAIError) as error:
         await mgr.create(req, model='model', workdir=tmp_path)
+    assert error.value.status_code == 503
     assert not mgr.mcp._registry, repr(mgr.mcp._registry)
-
-
-async def test_config_cleanup_preserves_externally_replaced_slot(tmp_path):
-    path = tmp_path/'mcp.json'
-    cfg = McpConfigManager(path)
-    slot = await cfg.add_conversation('fixture', 'http://127.0.0.1:9999/mcp/fixture')
-    replacement = {'serverUrl':'http://127.0.0.1:9998/foreign-fixture'}
-    path.write_text(json.dumps({'mcpServers':{slot:replacement}}))
-    await cfg.remove_conversation(slot)
-    assert json.loads(path.read_text())['mcpServers'].get(slot) == replacement
 
 
 async def test_dispatch_rejects_undeclared_tool():
@@ -196,16 +192,10 @@ async def test_close_reaps_child_processes(tmp_path, monkeypatch):
                 await asyncio.sleep(0.01)
         child_pid = int(sess.raw_tail[-1])
         await sess.aclose()
-        stat = Path(f'/proc/{child_pid}/stat')
-        try:
-            alive = stat.read_text().split()[2] != 'Z'
-        except (FileNotFoundError, ProcessLookupError):
-            alive = False  # reaped between exists() and read(): the outcome we want
-        assert not alive, f'Child PID {child_pid} survived AgySession.aclose()'
+        async with asyncio.timeout(3):
+            while pid_alive(child_pid):  # taskkill / SIGKILL land asynchronously
+                await asyncio.sleep(0.02)
     finally:
         await sess.aclose()
         if child_pid:
-            try:
-                os.kill(child_pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+            kill_pid(child_pid)

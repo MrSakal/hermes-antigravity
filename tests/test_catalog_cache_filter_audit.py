@@ -1,13 +1,20 @@
-"""Audit regressions for canonical discovery, exclusive cache reuse and bounded filtering."""
-from concurrent.futures import ThreadPoolExecutor
-from threading import Barrier
+"""Audit regressions for canonical discovery, exclusive reuse claims and bounded filtering.
+
+The history-prefix cache (``convcache``) these tests used to cover was
+subsumed by the conversation manager's IDLE/dormant reuse index; its
+invariants (structured fingerprints, namespacing, single-use atomic claims)
+are asserted against :func:`app.conversation.history_key` and
+``ConversationManager._claim_idle`` instead."""
+import asyncio
 
 import pytest
 from fastapi.testclient import TestClient
 
-from app.config import _FAMILY_VARIANTS, resolve_model
-from app.convcache import ConversationCache, history_key
+from app.agent_config import AgentPluginManager
+from app.config import Settings, _FAMILY_VARIANTS, resolve_model
+from app.conversation import ConversationManager, _Dormant, history_key
 from app.main import create_app
+from app.mcp_bridge import McpBridge
 from app.model_catalog import ModelCatalog, ModelEntry
 from app.openai_models import ChatMessage
 from app.textfilter import TableFlattener
@@ -25,57 +32,46 @@ def test_structured_fingerprints():
     def image(value):
         return [msg('user', [{'type': 'text', 'text': 'image'},
                              {'type': 'image_url', 'image_url': {'url': 'data:image/png;base64,' + value}}])]
-    assert history_key(image('AAAA')) != history_key(image('BBBB'))
-    assert history_key([msg('user', 'q', name='one')]) != history_key([msg('user', 'q', name='two')])
-    assert history_key([msg('tool', 'a', tool_call_id='one')]) != history_key([msg('tool', 'a', tool_call_id='two')])
-    def call(arg):
-        return [msg('assistant', None, tool_calls=[{'id': 'id', 'function': {'name': 'f', 'arguments': arg}}])]
-    assert history_key(call('{}')) != history_key(call('{"x":1}'))
-    assert history_key(history(), 'one') != history_key(history(), 'two')
+    assert history_key('s', image('AAAA')) != history_key('s', image('BBBB'))
+    assert history_key('s', [msg('user', 'q', name='one')]) != history_key('s', [msg('user', 'q', name='two')])
+    assert history_key('s', [msg('tool', 'a', tool_call_id='one')]) != history_key('s', [msg('tool', 'a', tool_call_id='two')])
+
+    def call(call_id, arg):
+        return [msg('assistant', None, tool_calls=[{'id': call_id, 'function': {'name': 'f', 'arguments': arg}}])]
+    # Tool calls match by id + name: clients re-serialize the argument JSON.
+    assert history_key('s', call('id', '{}')) == history_key('s', call('id', '{ }'))
+    assert history_key('s', call('id1', '{}')) != history_key('s', call('id2', '{}'))
+    # The spawn signature namespaces every key.
+    assert history_key('one', history()) != history_key('two', history())
+    # Assistant text is compared whitespace-stripped; system messages live in
+    # the signature (agent file / preamble hash), not in the key.
+    assert history_key('s', [msg('user', 'q'), msg('assistant', ' a\n')]) == \
+        history_key('s', [msg('system', 'sys'), msg('user', 'q'), msg('assistant', 'a')])
 
 
-def test_namespace_and_atomic_thread_claim():
-    cache = ConversationCache()
-    cache.store(history()[:1], 'a', 'cid', namespace='one')
-    assert cache.lookup(history(), namespace='two') is None
-    barrier = Barrier(8)
-    def claim(_):
-        barrier.wait()
-        return cache.lookup(history(), namespace='one')
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        hits = list(pool.map(claim, range(8)))
-    assert sum(h is not None for h in hits) == 1
-    assert len(cache) == 0
+async def test_dormant_claim_is_single_use_and_atomic(tmp_path):
+    mgr = ConversationManager(McpBridge(), Settings(_env_file=None, default_workdir=tmp_path),
+                              agents=AgentPluginManager(tmp_path / 'plugin'))
+    gone = asyncio.Event()
+    gone.set()
+    key = history_key('sig', history()[:-1])
+    mgr._dormant[key] = _Dormant('agy-1', gone)
+    results = await asyncio.gather(*(mgr._claim_idle(key) for _ in range(8)))
+    hits = [d for _, d in results if d is not None]
+    assert len(hits) == 1 and hits[0].agy_id == 'agy-1'
+    assert not mgr._dormant
+    # Another signature never sees it.
+    mgr._dormant[key] = _Dormant('agy-1', gone)
+    assert (await mgr._claim_idle(history_key('other', history()[:-1])))[1] is None
 
 
-def test_store_invalidates_prefixes_across_namespaces():
-    cache = ConversationCache()
-    cache.store(history()[:1], 'a', 'cid', 'one')
-    cache.store(history(), 'new answer', 'cid', 'two')
-    assert cache.lookup(history(), 'one') is None
-    assert cache.lookup(history() + [msg('assistant', 'new answer'), msg('user', 'branch')], 'two')
-
-
-def test_claim_invalidates_all_entries_for_same_conversation():
-    cache = ConversationCache()
-    cache.store(history()[:1], 'a', 'cid')
-    # Simulate legacy duplicate prefixes retained before the atomic-claim fix.
-    cache._entries['old-key'] = next(iter(cache._entries.values()))
-    assert cache.lookup(history())
-    assert not len(cache)
-
-
-def test_ambiguous_continuations_miss_without_claiming():
-    cache = ConversationCache()
-    cache.store(history()[:1], 'a', 'cid')
-    multimodal = history()[:-1] + [msg('user', [
-        {'type': 'text', 'text': 'next'},
-        {'type': 'image_url', 'image_url': {'url': 'data:image/png;base64,AAAA'}}])]
-    assert cache.lookup(multimodal) is None
-    assert cache.lookup(history())
-    remote = [msg('user', [{'type': 'image_url', 'image_url': {'url': 'https://example.test/image'}}])]
-    cache.store(remote, 'a', 'cid')
-    assert len(cache) == 0
+async def test_expired_dormant_record_misses(tmp_path):
+    settings = Settings(_env_file=None, default_workdir=tmp_path, conversation_cache_ttl_s=1)
+    mgr = ConversationManager(McpBridge(), settings, agents=AgentPluginManager(tmp_path / 'plugin'))
+    gone = asyncio.Event()
+    gone.set()
+    mgr._dormant['k'] = _Dormant('agy-1', gone, stored_at=0.0)
+    assert (await mgr._claim_idle('k'))[1] is None
 
 
 @pytest.mark.parametrize('live', [False, True])
@@ -90,8 +86,12 @@ def test_discovery_and_aliases_share_canonical_variants(live):
         app.state.model_catalog = cat
     client = TestClient(app)
     ids = [x['id'] for x in client.get('/v1/models').json()['data']]
-    assert len(ids) == len(set(ids)) == 14
-    assert ids == [e.slug for e in entries]
+    # Superset: variant slugs first (agy's order), then multi-variant family
+    # slugs, then display names — every advertised id is a valid input.
+    slugs = [e.slug for e in entries]
+    families = [f for f, v in _FAMILY_VARIANTS.items() if '' not in v]
+    assert len(ids) == len(set(ids))
+    assert ids == slugs + families + [e.display for e in entries]
     assert [m['name'] for m in client.get('/api/tags').json()['models']] == ids
     assert [m['id'] for m in client.get('/api/v1/models').json()['data']] == ids
     aliases = ids + [e.display for e in entries] + list(_FAMILY_VARIANTS) + ['flash', 'sonnet', 'opus']
@@ -110,7 +110,7 @@ def test_discovery_and_aliases_share_canonical_variants(live):
     ' ' * 100 + '| h |\n|---|\n',
     '| h |\n|---|\n' + '| row |\n' * 100,
     '| h |\n|---|\n|' + 'x' * 100,
-])
+], ids=['long-line', 'indented-table', 'long-table', 'ragged-row'])
 def test_overflow_raw_and_bounded(source, step):
     f = TableFlattener(max_pending_chars=32)
     out = []

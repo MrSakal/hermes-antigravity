@@ -20,6 +20,64 @@ import uuid
 import zlib
 
 
+def _linux_agy_pids() -> set[int]:
+    """agy processes started in stdin print mode (our argv), from /proc."""
+    found = set()
+    for path in Path("/proc").glob("[0-9]*/cmdline"):
+        try:
+            argv = path.read_bytes().split(b"\0")
+            if argv and os.path.basename(os.fsdecode(argv[0])) == "agy" and b"--print" in argv:
+                found.add(int(path.parent.name))
+        except (OSError, ValueError):
+            pass
+    return found
+
+
+def _windows_processes() -> list[tuple[int, int, str]]:
+    """(pid, parent pid, exe name) of every process via the Toolhelp32 API —
+    no tasklist, no psutil."""
+    import ctypes
+    from ctypes import wintypes
+
+    class PROCESSENTRY32W(ctypes.Structure):
+        _fields_ = [("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD),
+                    ("th32ProcessID", wintypes.DWORD), ("th32DefaultHeapID", ctypes.c_size_t),
+                    ("th32ModuleID", wintypes.DWORD), ("cntThreads", wintypes.DWORD),
+                    ("th32ParentProcessID", wintypes.DWORD), ("pcPriClassBase", ctypes.c_long),
+                    ("dwFlags", wintypes.DWORD), ("szExeFile", wintypes.WCHAR * 260)]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    snapshot = kernel32.CreateToolhelp32Snapshot(0x00000002, 0)  # TH32CS_SNAPPROCESS
+    if snapshot in (None, wintypes.HANDLE(-1).value):
+        raise OSError(ctypes.get_last_error(), "CreateToolhelp32Snapshot failed")
+    out = []
+    try:
+        entry = PROCESSENTRY32W()
+        entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+        ok = kernel32.Process32FirstW(snapshot, ctypes.byref(entry))
+        while ok:
+            out.append((entry.th32ProcessID, entry.th32ParentProcessID, entry.szExeFile))
+            ok = kernel32.Process32NextW(snapshot, ctypes.byref(entry))
+    finally:
+        kernel32.CloseHandle(snapshot)
+    return out
+
+
+def _windows_agy_pids() -> set[int]:
+    """Top-level agy.exe processes whose parent is a Python interpreter (the
+    server) — excludes agy's own helper children and an interactive agy the
+    user runs from a shell."""
+    procs = _windows_processes()
+    names = {pid: name.lower() for pid, _, name in procs}
+    return {pid for pid, ppid, name in procs
+            if name.lower() == "agy.exe" and names.get(ppid, "").startswith("python")}
+
+
+def server_agy_pids() -> set[int]:
+    return _windows_agy_pids() if os.name == "nt" else _linux_agy_pids()
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--port", type=int, default=8799)
@@ -119,17 +177,8 @@ def main():
         code, raw, _ = post({"model": args.model, "messages": messages, "tools": [tool]})
         check("MCP continuation", code == 200 and fixture in text(raw), text(raw)[:180])
 
-    # Inspect exact agy executable argv, never pgrep against our own shell text.
-    def agy_pids():
-        found = set()
-        for path in Path("/proc").glob("[0-9]*/cmdline"):
-            try:
-                argv = path.read_bytes().split(b"\0")
-                if argv and os.path.basename(os.fsdecode(argv[0])) == "agy" and b"--print" in argv:
-                    found.add(int(path.parent.name))
-            except (OSError, ValueError):
-                pass
-        return found
+    # Inspect exact agy executables, never pgrep against our own shell text.
+    agy_pids = server_agy_pids
 
     def metrics():
         with urllib.request.urlopen(base + "/metrics", timeout=5) as response:
@@ -157,20 +206,30 @@ def main():
             seen = agy_pids()
         start = time.monotonic()
         deadline = start + 10
-        while time.monotonic() < deadline and (metrics()["sessions_active"] or len(agy_pids()) > metrics()["warm_pool_idle"]):
+        # Processes now outlive their turn (parked IDLE for reuse) and the pool
+        # keeps warm ones: after the disconnect the OS-level agy count must
+        # equal exactly what the server accounts for (conversation-owned live
+        # processes + pool), with no turn left active.
+        while time.monotonic() < deadline and (metrics()["sessions_active"]
+                                               or len(agy_pids()) != metrics()["processes_total"]):
             time.sleep(0.1)
         m = metrics()
         check(f"disconnect stream={stream} tools={tools}",
-              active >= 1 and m["sessions_active"] == 0 and len(agy_pids()) == m["warm_pool_idle"],
+              active >= 1 and m["sessions_active"] == 0 and m["processes_running"] == 0
+              and len(agy_pids()) == m["processes_total"],
               f"procs during={sorted(seen - before) or sorted(seen)}, after={sorted(agy_pids())}, "
-              f"pool idle {idle_before}->{m['warm_pool_idle']}, reaped in {time.monotonic() - start:.2f}s")
+              f"server-accounted {m['processes_total']} (pool idle {idle_before}->{m['warm_pool_idle']}), "
+              f"reaped in {time.monotonic() - start:.2f}s")
 
     config = Path.home() / ".gemini/config/mcp_config.json"
-    entries = json.loads(config.read_text()).get("mcpServers", {})
+    entries = json.loads(config.read_text(encoding="utf-8")).get("mcpServers", {}) if config.exists() else {}
     leftovers = [key for key, value in entries.items() if f"127.0.0.1:{args.port}/mcp/" in str(value)]
     check("MCP slots cleaned", not leftovers, str(leftovers))
+    # mcp_transport_sessions is NOT in here: a tool conversation parked IDLE for
+    # reuse keeps agy's MCP session open (it closes with the conversation), so
+    # it is bounded by the live process count instead (checked below).
     idle_keys = ("sessions_active", "sessions_waiting", "sessions_suspended",
-                 "http_active", "attachment_workspaces_pinned", "mcp_transport_sessions")
+                 "processes_running", "http_active", "attachment_workspaces_pinned")
     # PID exit precedes completion of ASGI teardown. Observe the actual release
     # condition with the same bounded grace as disconnect/process cleanup above.
     cleanup_deadline = time.monotonic() + 10
@@ -181,6 +240,9 @@ def main():
         time.sleep(.05)
     check("all resource counters return to zero", all(snapshot.get(key) == 0 for key in idle_keys),
           str({key: snapshot.get(key) for key in idle_keys}))
+    check("MCP transports bounded by live conversations",
+          snapshot["mcp_transport_sessions"] <= snapshot["processes_live"],
+          f"{snapshot['mcp_transport_sessions']} transports, {snapshot['processes_live']} live processes")
     print(f"RESULT: {sum(results)}/{len(results)} passed", flush=True)
     return 0 if all(results) else 1
 

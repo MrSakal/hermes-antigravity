@@ -8,9 +8,11 @@ Open WebUI, etc. — at it and you get Antigravity's agent, using your existing
 Google-account sign-in shared with the Antigravity IDE (no API key, no per-token
 billing).
 
-Under the hood it drives `agy` as one subprocess per turn over its
-stdin/stdout `stream-json` protocol (requires agy >= 1.1.15); conversation history lives server-side in agy and
-follow-up turns resume it via `--conversation <id>`.
+Under the hood it drives `agy` as one PERSISTENT subprocess per conversation over
+its stdin/stdout `stream-json` protocol (requires agy >= 1.1.15; tuned for 1.4.8):
+a process survives its turn and answers the next one, a pre-booted warm pool
+serves the first turn of new conversations, and a conversation whose process is
+gone resumes via `--conversation <id>`.
 
 ## What it does
 
@@ -25,16 +27,23 @@ follow-up turns resume it via `--conversation <id>`.
 - **Builtin-tool restrictions:** plain chat defaults to a `view_file` allowlist
   (including image viewing). Tool-passthrough turns still require the full builtin
   set for dynamic MCP dispatch. This is not an OS or filesystem sandbox.
-- **Conversation cache:** a follow-up request whose history matches a previous
-  turn resumes the stored agy conversation and sends only the newest user
-  message — cheaper and smaller on the upstream wire. The request byte cap still applies.
+- **Cross-turn reuse:** after a clean answer the process is parked IDLE under
+  (spawn signature + normalized history incl. the answer exactly as returned).
+  A follow-up whose `messages[:-1]` match adopts it and only the newest user
+  message is written to its stdin — no boot, no re-folded transcript. When the
+  parked process is gone (LRU-evicted past `AGI_MAX_SESSIONS`, idle TTL,
+  crash) its agy conversation id is kept as a *dormant* record and the
+  follow-up respawns with `--conversation <id>`, again sending only the newest
+  message. Any mismatch (edited history, other model/system prompt/tools) is a
+  safe miss: a fresh process with the whole history folded in.
 - **Real system prompts via managed agents** (default on): agy has no
   system-prompt flag, but it does support custom agents. The request's system
-  message is materialized as an agent definition inside a server-managed plugin
-  (`~/.gemini/config/plugins/hermes-bridge/agents/hermes-<hash>.md`) and agy is
-  spawned with `--agent <slug>` — the agent body rides at true system-prompt
-  level, behaviorally overrides the CLI's built-in persona, and stays in effect
-  across conversation resumes. (Antigravity's base identity/environment context
+  message is written into ONE server-managed agent file
+  (`~/.gemini/config/plugins/hermes-bridge/agents/hermes.md`, rewritten only
+  when its bytes change) and agy is spawned with `--agent hermes` — the agent
+  body rides at true system-prompt level and behaviorally overrides the CLI's
+  built-in persona. Every spawn holds a lock from the file write until agy's
+  first stdout line, so concurrent requests never see each other's prompt. (Antigravity's base identity/environment context
   remains present underneath — the equivalent of hermes-claude's
   `--append-system-prompt` mode; a full "bare model" replacement is not
   possible, see the deviations note below.) When disabled the system message
@@ -110,27 +119,32 @@ automatically. The systemd example below uses `EnvironmentFile`.
 | `AGI_DISABLE_SLASH_COMMANDS` | `true` | Prevent user content from invoking CLI slash commands. |
 | `AGI_STRICT_MODEL` | `true` | Reject unknown models with 400 `model_not_found`; false retains legacy default fallback. |
 | `AGI_MODEL_CATALOG_REFRESH_S` | `3600` | Query `agy models` at startup and periodically; 0 disables periodic refresh. Failed refresh retains the last good catalog, with static fallback before the first successful load. |
-| `AGI_PLAIN_CHAT_TOOLS` | `readonly` | Agent builtin allowlist: `readonly` = view_file, `none` = no tools, `all` = unrestricted. |
+| `AGI_PLAIN_CHAT_TOOLS` | `readonly` | Agent builtin allowlist: `readonly` = `tools: [view_file]`, `none` = `tools: []`, `all` = no `tools:` field (every builtin). |
 | `AGI_TOOL_TURN_TOOLS` | `all` | Dynamic MCP dispatch requires the full builtin set on current agy. |
+| `AGI_INHERIT_USER_MCP` | `false` | Agent `inheritMcp`. False: tool turns see exactly their own hermes MCP server and plain chat none; true also exposes the user's servers from the shared `mcp_config.json`. |
 | `AGI_DISCONNECT_POLL_S` | `1.0` | Nonstream disconnect polling interval for plain and tool turns; 0 disables polling. Streaming cancellation also reaps the process. |
-| `AGI_SYSTEM_PROMPT_VIA_AGENT` | `true` | Deliver the system message as a generated agent definition (`--agent <slug>`), overriding the CLI persona. Off → prompt preamble; readonly/none still require an agent and fail closed if it cannot be created. |
-| `AGI_AGENT_PLUGIN_PATH` | `~/.gemini/config/plugins/hermes-bridge` | Managed agent-plugin directory override. |
-| `AGI_AGENT_CACHE_MAX` | `64` | Max generated agent files kept (LRU by mtime). |
+| `AGI_SYSTEM_PROMPT_VIA_AGENT` | `true` | Deliver the system message as the body of the managed agent file (`--agent hermes`), overriding the CLI persona. Off → prompt preamble; readonly/none and tool turns still require the agent and fail closed (503) if it cannot be written. |
+| `AGI_AGENT_PLUGIN_PATH` | `~/.gemini/config/plugins/hermes-bridge` | Managed agent-plugin directory override. A second server on the same HOME should use its own directory **and** `AGI_AGENT_NAME` (`scripts/bench.py` does). |
+| `AGI_AGENT_NAME` | `hermes` | Managed agent name (`agents/<name>.md`, `--agent <name>`). |
+| `AGI_AGENT_START_TIMEOUT_S` | `30` | Max wait for a spawned agy's first stdout line while the agent-file lock is held; on timeout the process is killed and the request fails 504. A hung agy blocks every other spawn this long, so keep it short; a request whose spawn queue would outlast its deadline fails fast with **503 `spawn_queue_full`**. (`AGI_AGENT_CACHE_MAX` is gone: there is only one agent file.) |
 | `AGI_AGY_BRAIN_PATH` | `~/.gemini/antigravity-cli/brain` | Brain (conversation transcript) directory override — the source of the always-on `reasoning_content` passthrough. |
 | `AGI_IMAGE_INPUT` | `true` | Materialize data-URL images as files under `<workdir>/attachments/` and reference them in the prompt. |
-| `AGI_CONVERSATION_CACHE_MAX` | `256` | Max entries in the history→conversation-id cache. |
-| `AGI_CONVERSATION_CACHE_TTL_S` | `3600` | Cache entry lifetime. |
-| `AGI_MANAGE_MCP_CONFIG` | `true` | Allow registering per-conversation entries in the shared MCP config (required for tool calling). |
-| `AGI_MCP_CONFIG_PATH` | `~/.gemini/config/mcp_config.json` | Shared Antigravity MCP config location override. |
+| `AGI_SESSION_REUSE` | `true` | Park processes IDLE after a turn for cross-turn reuse (`false` = one process per turn; follow-ups still resume dormant conversations). |
+| `AGI_CONVERSATION_CACHE_MAX` | `256` | Max dormant records (history key → agy conversation id of a process that is gone). |
+| `AGI_CONVERSATION_CACHE_TTL_S` | `3600` | Dormant record lifetime. |
+| `AGI_COMPLETED_CALL_MEMORY_MAX` / `_S` | `1024` / `600` | Recently delivered `tool_call_id`s; a duplicate continuation for them is 409, not a rebuild. |
+| `AGI_MANAGE_MCP_CONFIG` | `true` | Allow the one-time startup removal of `hermes`/`hermesN` slots older builds left in the shared MCP config (backed up first). The server never writes that file otherwise; tool calling no longer depends on it. |
+| `AGI_MCP_CONFIG_PATH` | `~/.gemini/config/mcp_config.json` | Shared Antigravity MCP config location override (legacy cleanup only). |
 | `AGI_FLATTEN_MARKDOWN_TABLES` | `false` | Optional bounded pipe-table to ASCII conversion. |
 | `AGI_DEFAULT_WORKDIR` | `~/agi-workspace` | Working dir granted to agy via `--add-dir` (and used as cwd). |
 | `AGI_ALLOWED_WORKDIR_ROOTS` | `[]` | JSON list of extra roots a per-request `workdir` may resolve under. |
 | `AGI_REQUEST_TIMEOUT_S` | `600` | Absolute HTTP turn deadline, including queue/startup time. |
 | `AGI_SUSPENDED_TTL_S` | `300` | How long a tool-suspended conversation may wait for its results before GC. |
-| `AGI_IDLE_SESSION_TTL_S` | `900` | Idle conversation eviction age. |
+| `AGI_IDLE_SESSION_TTL_S` | `900` | A parked IDLE process is shut down (kept dormant) after this long. |
 | `AGI_GC_INTERVAL_S` | `30` | GC sweep interval. |
 | `AGI_REBUILD_ON_EXPIRY` | `true` | Rebuild an expired tool continuation from the resent history instead of 409. |
-| `AGI_WARM_POOL_SIZE` | `0` | Pre-booted idle agy procs for fresh autonomous turns (see [Warm pool](#warm-pool)). |
+| `AGI_WARM_POOL_SIZE` | `2` | Pre-booted idle agy procs (total) for the first turn of new conversations, plain or tool (≈200 MB each; `0` = off; see [Warm pool](#warm-pool)). |
+| `AGI_WARM_POOL_SIGNATURES` | `2` | How many distinct spawn signatures (model + agent/system prompt + toolset) the pool keeps warm at once; `AGI_WARM_POOL_SIZE` is split across them. |
 | `AGI_WARM_POOL_MAX_IDLE_S` | `600` | Recycle an idle pooled proc after this many seconds. |
 | `AGI_LOG_LEVEL` | `INFO` | Log level. |
 | `AGI_TIMING_LOG` | `false` | Emit per-turn latency metrics to the `agi.timing` logger. |
@@ -237,15 +251,38 @@ request/image/schema caps, attachment retention, error semantics, and migration.
 
 ### Warm pool
 
-agy boots for ~3.5 s before it reads its prompt, on every turn, regardless of
-the prompt. `AGI_WARM_POOL_SIZE=N` keeps `N` procs pre-booted with the prompt
-deferred; a fresh autonomous turn whose model/workdir/agent match adopts one and
-pays only model latency. Measured on this host (Gemini 3.8 Flash Low, short
-prompt): **5.5 s → 1.5 s** per turn, TTFT p50 1.26 s. Conversation-cache
-resumes (`--conversation` is spawn-time argv) and tool turns (per-conversation
-MCP slot) always cold-start. Each idle proc is ~175 MB RSS and one conversation
-DB on disk; 1–2 is the sane range for one user. `/metrics` exposes
-`warm_pool_idle` / `warm_pool_hits` / `warm_pool_misses`.
+agy boots for 1–3 s (1.4.8) before it reads its first message. The warm pool
+(**on by default**, `AGI_WARM_POOL_SIZE=2`, `AGI_WARM_POOL_SIGNATURES=2`)
+keeps pre-booted procs for the hottest spawn signatures (model / workdir /
+agent file / toolset) among the recent fresh turns — two by default, so hermes'
+main loop and its side calls with a different system prompt both stay warm. A
+signature already warm is not displaced by one miss of another: a newcomer must
+recur (seen twice within the last 16 fresh turns; LRU among those); the FIRST turn
+of a new conversation adopts one and pays only model latency (follow-ups use
+cross-turn reuse instead). It serves **tool turns too**: a pooled entry pre-mints
+its `conv_id`, registers an MCP bridge under `/mcp/<conv_id>`, boots with that
+URL baked into its agent file (`hermes-<toolset sha8>` server), and the
+request's tools are late-bound before the first stdin message — safe because
+agy connects to MCP servers lazily, at that first message. Because agy caches
+tool schemas per server *name*, a pooled tool proc is only adopted by a request
+with exactly the same toolset (the name stays content-addressed, nothing to
+clean up); the first request of a new toolset is cold.
+Refills spawn under the same agent-file lock as every other spawn but yield it
+to request-driven spawns. A pooled boot that fails (agy exits before its first
+line: logged out, unknown model, rejected agent) or a pooled proc dying idle
+puts the pool into exponential backoff (1 s doubling to 60 s, one log line per
+step, reset on the next good boot) — no respawn loop. A cold request hitting
+the same boot failure gets a **502 `upstream_start_failed`** carrying agy's
+stderr tail.
+
+Cost: **≈200 MB RSS per idle pooled proc** plus one empty conversation DB
+under `~/.gemini/antigravity-cli/conversations`; pooled procs are not counted
+against `AGI_MAX_SESSIONS`. Set `AGI_WARM_POOL_SIZE=0` to disable it (e.g. on a
+small VPS); 1–2 is the sane range for one user. `/metrics` exposes
+`warm_pool_idle` / `warm_pool_hits` / `warm_pool_tool_hits` /
+`warm_pool_misses` / `warm_pool_spawn_failures` / `warm_pool_targets`, next to `processes_live` / `processes_idle` /
+`processes_total`, `reuse_hits` / `reuse_misses`, `dormant_resumes` /
+`dormant_lost`, `idle_evictions` and `duplicate_continuations`.
 
 ### agy leaves state behind
 
@@ -253,51 +290,73 @@ The CLI persists every conversation, transcript and per-process log under
 `~/.gemini/antigravity-cli` with no retention, and does not checkpoint its
 SQLite WALs (measured: 480 MB after ~900 turns, 255 MB of it WAL).
 `scripts/prune_agy_state.py` removes conversations older than `--keep-days`
-(db + wal + brain + presence lock as a unit), stale logs and orphan locks, and
-with `--checkpoint` folds the kept WALs back into their DBs. `deploy/` ships a
-daily systemd user timer for it. The bridge tolerates pruned conversations: a
+(db + wal + brain + presence lock as a unit), stale logs, orphan locks and old
+`mcp/hermes-<8hex>/` tool-schema caches, and with `--checkpoint` folds the kept
+WALs back into their DBs. It runs while the server's persistent processes and
+warm pool are alive: conversations referenced by a live process
+(`--conversation <id>` in its argv; `/proc` on Linux, Toolhelp32 + command line
+on Windows) or touched within `--keep-days` are skipped. Exit 0 = done, 2 = live
+processes cannot be listed (refused unless `--force`). `deploy/` ships a daily
+systemd user timer for it. The bridge tolerates pruned conversations: a
 resume of a missing id is detected from agy's `init` (it silently starts a new
 conversation) and the full history is refolded.
 
-## The shared MCP config
+## MCP: strict, per spawn, in the agent file
 
-The only MCP configuration agy honors (verified against 1.1.4) is
-`~/.gemini/config/mcp_config.json` — the same file the Antigravity IDE manages,
-including your own servers and their secrets. For tool calling this server
-merges per-conversation entries into it and removes them at conversation end:
+agy 1.4.8 lets an agent declare its own MCP servers. A tool turn's agent file
+carries exactly one:
 
-- Foreign entries are **never modified**; writes are atomic (temp file +
-  replace) and serialized behind one lock.
-- Leftover `hermes*` entries from a crashed run are cleaned at startup
-  (matched by our port).
-- Set `AGI_MANAGE_MCP_CONFIG=false` to forbid touching the file entirely —
-  tool calling then returns 400; plain chat is unaffected.
+```yaml
+inheritMcp: false            # AGI_INHERIT_USER_MCP
+mcpServers:
+  - name: hermes-<sha8 of the canonical tools JSON>
+    serverUrl: "http://127.0.0.1:<port>/mcp/<conv_id>"
+```
 
-There is no warm pool (and none is needed): agy's persistent backend daemon
-absorbs the cold start, so a per-turn subprocess spawn measures ~30–50 ms
-(versus ~2.5 s TTFT for a cold `claude` spawn in the sibling project).
+`inheritMcp: false` hides the user's own servers from the shared
+`~/.gemini/config/mcp_config.json` (builtins stay). The server name is per
+toolset because agy caches tool schemas per server name; the conversation is
+routed by the URL. agy contacts the server only at the first user message.
+
+The shared `mcp_config.json` (the Antigravity IDE's file, with your servers and
+secrets) is **never written** during operation. At startup, `hermes`/`hermesN`
+entries that older builds left there are removed once — only those whose URL is
+`http://127.0.0.1:<any port>/mcp/conv<N>-<old id>`; a user's own `hermes`
+server survives — after a one-time backup to
+`mcp_config.json.hermes-antigravity.bak`. `AGI_MANAGE_MCP_CONFIG=false` skips
+even that. Per-prompt `hermes-<12hex>.md` agent files from older builds are
+deleted at startup too.
 
 ## The managed agent plugin
 
-For system-prompt delivery the server owns one plugin directory,
-`~/.gemini/config/plugins/hermes-bridge/` (override with
-`AGI_AGENT_PLUGIN_PATH`). Each distinct (system prompt, tool mode) pair becomes
-`agents/hermes-<sha1[:12]>.md` — created on first use, discovered by agy at
-conversation start with no install step, reused on repeat requests and
-conversation resumes (the slug is deterministic), and pruned LRU beyond
-`AGI_AGENT_CACHE_MAX`. Only files matching the `hermes-<hash>.md` pattern are
-ever pruned; other plugins and hand-written agents are never touched. Set
-`AGI_SYSTEM_PROMPT_VIA_AGENT=false` to use a system-message preamble. A neutral
-agent is still installed for readonly/none tool restrictions. Only explicit
-`AGI_PLAIN_CHAT_TOOLS=all` permits agent-free fallback; plugin write failures in
-restricted modes return **503 `agent_unavailable`**.
+For system prompt, tool allowlist and MCP server the server owns one plugin
+directory, `~/.gemini/config/plugins/hermes-bridge/` (override with
+`AGI_AGENT_PLUGIN_PATH`), holding exactly one agent file, `agents/hermes.md`.
+agy reads `--agent` at process boot, always before it prints its first stdout
+line (the `init` event, printed even before any prompt arrives), and rewriting
+the file afterwards does not affect the running process. So every spawn —
+cold, `--conversation` resume, warm-pool refill — takes one lock, rewrites the
+file only if its bytes differ, spawns, and releases the lock when agy printed
+its first line. The same window is held under an advisory OS file lock,
+`agents/.hermes.md.lock` (`flock` / `msvcrt.locking`, polled without blocking
+the event loop), so two servers sharing the directory cannot rewrite the file
+under each other's boot. If the first line does not arrive within
+`AGI_AGENT_START_TIMEOUT_S` the process is killed before the lock is released
+(504); if agy exits first, the spawn fails 502 with its stderr tail. Other plugins and
+hand-written agents are never touched. Set `AGI_SYSTEM_PROMPT_VIA_AGENT=false`
+to use a system-message preamble; the agent is still used (neutral body) for
+readonly/none restrictions and tool turns. Only explicit
+`AGI_PLAIN_CHAT_TOOLS=all` permits agent-free plain chat; plugin write failures
+otherwise return **503 `agent_unavailable`**.
 
-Limits of the agent mechanism (tool behavior checked against agy 1.1.27):
+Limits of the agent mechanism (frontmatter checked against agy 1.4.8):
 
-- `tools: ["view_file"]` restricts builtin access (agy may also expose its internal
-  `manage_task` helper). `tools: []` disables it; `tools: "*"` grants all builtins.
-  Explicit `call_mcp_tool` allowlisting fails on this CLI, so tool turns retain
-  full permissions. The CLI's `--sandbox` flag did not enforce isolation in live
+- `tools: [view_file]` restricts builtin access (agy also keeps its internal
+  `manage_task` helper); `tools: []` leaves only `manage_task`. The scalar
+  `tools: "*"` older builds wrote is **rejected** by 1.4.8 (agent skipped,
+  every turn "unknown agent"), and `["*"]` fails at runtime — the full builtin
+  set is granted by omitting `tools:`. Explicit `call_mcp_tool` allowlisting
+  fails, so tool turns retain full permissions. The CLI's `--sandbox` flag did not enforce isolation in live
   probes and is deliberately **not** used as a security boundary.
 - Readonly does **not** mean confidential: `view_file` can read files accessible
   to the service user, not merely attachments. Use `none` for text-only tasks that
@@ -402,11 +461,13 @@ OpenAI client ──HTTP /v1──▶ agi-server ──NDJSON stdin / stdout─�
        └──── tool result ──────▶┘           (/mcp/<conv_id>, loopback)
 ```
 
-- **Autonomous turn** (no `tools`): the conversation is folded into one prompt
-  for a fresh agy conversation (or resumed via the conversation cache); the
-  streamed `step_update` text deltas become SSE or a single JSON completion.
-- **Tool turn:** a conversation owns one agy subprocess, an MCP bridge, and its
-  own entry in the shared MCP config. When the model calls a bridged function,
+- **Every turn** goes through one conversation manager: reuse a parked IDLE
+  process (newest message only), resume a dormant agy conversation
+  (`--conversation`), adopt a warm-pool proc, or spawn fresh with the history
+  folded into one prompt; the streamed `step_update` text deltas become SSE or a
+  single JSON completion.
+- **Tool turn:** a conversation owns one agy subprocess and an MCP bridge
+  declared in its agent file (the shared MCP config is never written). When the model calls a bridged function,
   the subprocess blocks inside the MCP call; the server returns a `tool_calls`
   response and parks the conversation `SUSPENDED`. The next request (carrying
   the tool results) resolves the pending futures and the same subprocess
@@ -414,8 +475,13 @@ OpenAI client ──HTTP /v1──▶ agi-server ──NDJSON stdin / stdout─�
 - **finish_reason** is inferred (`stop` on success, `tool_calls` on suspension);
   `usage` carries prompt/completion/total tokens plus
   `completion_tokens_details.reasoning_tokens`.
-- A background GC reaps suspended-too-long and idle conversations (and their
-  config entries).
+- A background GC reaps suspended-too-long conversations, idle ones past
+  `AGI_IDLE_SESSION_TTL_S` (kept dormant), and claimed turns nobody drove.
+- A duplicate of a continuation whose results were already delivered gets 409
+  (`tool_result_expired`), never a rebuild that would re-run the turn: the
+  server remembers recently completed `tool_call_id`s (10 min / 1024 ids).
+- A process that dies mid-turn is an error (502 / SSE error event), never a
+  truncated `stop`.
 - Disconnect teardown uses pure ASGI auth middleware and shielded cancellation
   cleanup: TERM, then KILL after 5 seconds if necessary. Non-streaming tool and
   plain-chat requests poll the connection; streaming responses close on cancellation.

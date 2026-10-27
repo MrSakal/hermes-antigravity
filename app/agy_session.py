@@ -1,32 +1,36 @@
-"""Async ``agy`` CLI driver — one subprocess per turn.
+"""Async ``agy`` CLI driver — one PERSISTENT subprocess per conversation.
 
-Unlike the `claude` CLI (bidirectional stream-json over a persistent stdin/stdout
-process), `agy` is invoked once per turn: the process runs the turn to
-completion and exits. Conversation continuity is server-side in agy:
-``--conversation <id>`` resumes the stored history, so a follow-up turn passes
-only the newest user message.
+agy (>= 1.1.15; verified on 1.4.8) has a stdin mode equivalent to ``claude -p
+--input-format stream-json``: ``--print "" --input-format stream-json
+--output-format stream-json``. Each stdin line
+``{"event":"user","message":{"role":"user","content":<str>}}`` runs ONE turn,
+which ends with exactly one ``result`` line; the process then waits for the
+next line on the same agy conversation (context kept). stdin EOF → exit 0.
+Verified facts this module relies on:
 
-The prompt travels over **stdin** as one NDJSON line
-(``{"event":"user","message":{"role":"user","content":...}}``) using
-``--input-format stream-json`` (agy >= 1.1.15; verified against 1.1.27). This
-removes the argv size ceiling (Linux ``MAX_ARG_STRLEN`` = 128 KiB per argument,
-Windows ~32 K chars) that the previous ``-p <prompt>`` transport hit — prompts of
-several hundred KB are delivered intact. ``--print`` still has to be given (with
-an empty value) to select print mode; ``-p --input-format`` would swallow the
-flag as the prompt. stdin is closed after the single line, so agy runs exactly
-one turn and exits.
+* The ``init`` line is printed at BOOT (≈1–3 s after spawn), before any stdin
+  message, and the ``--agent`` file is read before it. :meth:`wait_started`
+  is the message-free proof a spawn got that far (see app.agent_config).
+* Content must be TEXT only — any other block errors the turn AND exits the
+  process (rc=1). :meth:`send` therefore only takes a string; images travel
+  as workdir files referenced in the text.
+* No per-turn cancel (``control_request`` is fatal): aborting a turn means
+  killing the process. Model / effort / agent / ``--add-dir`` are fixed per
+  process.
+* ``--print-timeout`` counts from the first prompt; a persistent process is
+  spawned with ``0s`` (disabled) and our own per-turn deadlines bound it.
 
-The prompt may be deferred: ``prompt=None`` spawns the process and lets it boot
-(~3.5 s on this host, measured against 1.1.27) without a user turn; a later
-:meth:`send` delivers the NDJSON line. ``--print-timeout`` starts counting at
-the first prompt, not at boot (verified: an idle process outlived a 15 s
-timeout), which is what makes :mod:`app.warmpool` possible.
+The prompt travels over stdin, so there is no argv ceiling (Linux
+``MAX_ARG_STRLEN`` 128 KiB, Windows ~32 K chars). ``prompt=None`` spawns and
+lets the process boot without a turn (the warm pool); :meth:`send` delivers
+turns later, as many as the conversation needs.
 
 A reader task parses stdout JSONL lines into :data:`~app.events.ChatEvent`
-values pushed onto an :class:`asyncio.Queue`; :data:`STREAM_CLOSED` marks EOF
-(process exit). The last few unparseable stdout lines and a stderr tail are kept
-for diagnostics (agy prints some errors as plain text, e.g. the headless
-permission notice).
+values on a bounded :class:`asyncio.Queue`. The MCP bridge pushes its
+:class:`~app.mcp_bridge.PendingCall` items into the SAME stream via
+:meth:`inject`, so a turn loop awaits one source instead of racing two tasks
+per event. :data:`STREAM_CLOSED` marks stdout EOF, which in stdin mode means
+the process DIED (a clean turn end is a ``result`` line, never EOF).
 """
 
 from __future__ import annotations
@@ -37,6 +41,7 @@ import json
 import logging
 import os
 import signal
+import subprocess
 import time
 
 from collections import deque
@@ -50,8 +55,8 @@ from app.timing import log_spawn
 
 logger = logging.getLogger("agi.session")
 
-# Sentinel placed on the event queue when the CLI's stdout reaches EOF (the
-# process exited). Consumers stop waiting for turn events when they see it.
+# Sentinel returned once the CLI's stdout reached EOF — in stdin mode that
+# means the process exited (crash, kill, or stdin closed).
 STREAM_CLOSED = object()
 
 # StreamReader line buffer. Tool outputs embedded in step_update lines can be
@@ -59,23 +64,28 @@ STREAM_CLOSED = object()
 # pathologically long line.
 _READ_LIMIT = 64 * 1024 * 1024
 
+# How long a graceful close (IDLE process) waits for agy to exit on stdin EOF
+# before it is killed.
+_GRACEFUL_EXIT_S = 2.0
+
 
 def stdin_payload(prompt: str) -> bytes:
-    """The single NDJSON line agy reads as the user turn (``--input-format
-    stream-json``). Shape verified against agy 1.1.27; any other ``event``
-    value is rejected by the CLI with ``stream input message is missing the
-    "event" field`` or similar."""
+    """One NDJSON user line (``--input-format stream-json``) = one turn.
+
+    ``errors="replace"``: client JSON may carry a lone surrogate that strict
+    UTF-8 refuses — raising here would fail an already claimed turn, while one
+    ``?`` in the prompt is harmless."""
     return (
         json.dumps(
             {"event": "user", "message": {"role": "user", "content": prompt}},
             ensure_ascii=False,
         )
         + "\n"
-    ).encode("utf-8")
+    ).encode("utf-8", "replace")
 
 
 class AgySession:
-    """Drives one ``agy`` subprocess for a single turn."""
+    """Drives one persistent ``agy`` stdin-mode subprocess."""
 
     def __init__(
         self,
@@ -86,7 +96,7 @@ class AgySession:
         prompt: Optional[str] = None,
         conversation_id: Optional[str] = None,
         agent: Optional[str] = None,
-        print_timeout_s: int = 600,
+        print_timeout_s: int = 0,
         disable_slash_commands: bool = True,
         timing_log: bool = False,
         timing_label: str = "session",
@@ -101,8 +111,13 @@ class AgySession:
         self.model = model
         self.workdir = str(workdir)
         self.prompt = prompt
+        # Set at construction for a ``--conversation`` resume; otherwise learned
+        # from the init / result lines (see ConversationManager.run_turn).
         self.conversation_id = conversation_id
+        self.resumed = conversation_id is not None
         self.agent = agent
+        # 0 = disabled: a persistent process idles between turns and blocks
+        # inside our MCP call_tool; the turn loop enforces its own deadline.
         self.print_timeout_s = print_timeout_s
         self.disable_slash_commands = disable_slash_commands
         self.timing_log = timing_log
@@ -110,18 +125,38 @@ class AgySession:
 
         self._proc: Optional[asyncio.subprocess.Process] = None
         self._queue: asyncio.Queue[Union[ChatEvent, object]] = asyncio.Queue(maxsize=event_queue_size)
+        # Items pushed by the MCP bridge (PendingCall). Unbounded here: the
+        # bridge enforces max_pending_tool_calls before it injects.
+        self._injected: deque[object] = deque()
         self._reader_task: Optional[asyncio.Task[None]] = None
         self._stderr_task: Optional[asyncio.Task[None]] = None
         self._stdin_task: Optional[asyncio.Task[None]] = None
         self._closed = False
         self._eof = False
-        self._sent = False
+        self.turns_sent = 0
         self.spawned_at: Optional[float] = None
         self._available = asyncio.Event()
+        # Set on the first stdout line (or EOF): agy has read its --agent file
+        # by then (see app.agent_config), so the spawn lock may be released.
+        self._started = asyncio.Event()
+        # True once a real stdout line arrived. EOF without one = agy died at
+        # boot (logged out, bad --model, rejected agent frontmatter): see
+        # :attr:`boot_failed`.
+        self._got_line = False
         self._writer_error: Optional[Error] = None
         self._close_task: Optional[asyncio.Task[None]] = None
+        # Teardown mode read by _close_impl: graceful = close stdin and let agy
+        # exit on its own first (an IDLE process — it flushes its conversation
+        # DB for a later --conversation resume); otherwise straight to the kill.
+        self._graceful_close = False
+        # Windows: the ``taskkill /T /F`` started by kill_now().
+        self._killer: Optional[subprocess.Popen] = None
         self._pgid: Optional[int] = None
-        self._pushback: list[Union[ChatEvent, object]] = []
+        self._pushback: deque[Union[ChatEvent, object]] = deque()
+        # Set once teardown finished and the process is gone: a
+        # ``--conversation`` resume of the same agy conversation must not start
+        # while this process may still write to it.
+        self.closed_event = asyncio.Event()
         # Diagnostics: last raw stdout lines the parser skipped + stderr tail.
         self.raw_tail: deque[str] = deque(maxlen=5)
         self.stderr_tail: deque[str] = deque(maxlen=5)
@@ -138,7 +173,7 @@ class AgySession:
             "--input-format", "stream-json",
             "--output-format", "stream-json",
             "--dangerously-skip-permissions",
-            "--print-timeout", f"{self.print_timeout_s}s",
+            "--print-timeout", f"{max(0, int(self.print_timeout_s))}s",
             "--add-dir", self.workdir,
         ]
         if self.disable_slash_commands:
@@ -177,6 +212,8 @@ class AgySession:
                 stderr=asyncio.subprocess.PIPE,
                 cwd=self.workdir,
                 limit=_READ_LIMIT,
+                # POSIX: own process group, so one killpg reaches agy's
+                # children even after the leader exited.
                 start_new_session=(os.name == "posix"),
             )
         except FileNotFoundError as e:
@@ -194,32 +231,91 @@ class AgySession:
             self.send(self.prompt)
 
     def send(self, prompt: str) -> None:
-        """Deliver the single user turn. Exactly once per process.
+        """Start one turn: write a user line to stdin. stdin stays OPEN, so the
+        process survives the turn and takes the next one on the same agy
+        conversation.
 
-        Runs in the background: agy takes seconds to boot before it drains
-        stdin, and a payload larger than the pipe buffer would otherwise block
-        the caller (and the HTTP response) for that long."""
+        The write runs in the background: before boot agy does not drain stdin,
+        and a payload larger than the pipe buffer would otherwise block the
+        caller (and the HTTP response) for that long. Successive writes are
+        chained, never interleaved."""
         if self._proc is None:
             raise RuntimeError("session not started")
-        if self._sent:
-            raise RuntimeError("prompt already sent")
-        self._sent = True
+        if not isinstance(prompt, str):
+            raise TypeError("agy stdin mode accepts text content only")
+        if not self.running:
+            raise RuntimeError(f"agy process is not running ({self.diagnostics()})")
         self.prompt = prompt
+        self.turns_sent += 1
         payload = stdin_payload(prompt)
-        logger.debug("agy stdin: %d bytes", len(payload))
-        self._stdin_task = asyncio.create_task(self._feed_stdin(payload), name="agy-stdin")
+        logger.debug("agy stdin: %d bytes (turn %d)", len(payload), self.turns_sent)
+        self._stdin_task = asyncio.create_task(
+            self._feed_stdin(payload, self._stdin_task), name="agy-stdin")
+
+    async def wait_started(self, timeout: float) -> bool:
+        """Wait until the process printed its first stdout line (or exited).
+
+        Returns False on timeout. EOF also returns True (the process can no
+        longer read anything, so the agent-file lock may be released) — callers
+        must then check :attr:`boot_failed`, which tells a dead boot from a live
+        one. Already-queued events count as started so test doubles that fill
+        the queue without a real process pass through."""
+        if self._started.is_set() or self._eof or not self._queue.empty() or self._pushback:
+            return True
+        if self._proc is None:
+            return True  # nothing was spawned, so nothing can read the agent file
+        try:
+            async with asyncio.timeout(timeout):
+                await self._started.wait()
+        except TimeoutError:
+            return False
+        return True
+
+    @property
+    def boot_failed(self) -> bool:
+        """stdout reached EOF before agy printed a single line: the process
+        died during boot and never served anything."""
+        return self._eof and not self._got_line and self._proc is not None
+
+    async def exit_diagnostics(self, timeout: float = 1.0) -> str:
+        """:meth:`diagnostics` once the dead process' stderr is drained and its
+        exit code is known (bounded by ``timeout``) — the stderr tail is what
+        says WHY agy refused to boot (not signed in, unknown model, bad agent)."""
+        proc, stderr_task = self._proc, self._stderr_task
+        waiter = None
+        try:
+            waits: list[asyncio.Future] = []
+            if stderr_task is not None and not stderr_task.done():
+                waits.append(stderr_task)
+            if proc is not None and proc.returncode is None:
+                waiter = asyncio.ensure_future(proc.wait())
+                waits.append(waiter)
+            if waits:
+                await asyncio.wait(waits, timeout=timeout)
+        finally:
+            if waiter is not None and not waiter.done():
+                waiter.cancel()
+        return self.diagnostics()
 
     @property
     def running(self) -> bool:
-        return self._proc is not None and self._proc.returncode is None
+        return (self._proc is not None and self._proc.returncode is None
+                and not self._closed and not self._eof)
+
+    @property
+    def pid(self) -> Optional[int]:
+        return self._proc.pid if self._proc is not None else None
 
     @property
     def idle_s(self) -> float:
         """Seconds since spawn; meaningful for pooled, not-yet-prompted procs."""
         return 0.0 if self.spawned_at is None else time.monotonic() - self.spawned_at
 
-    async def _feed_stdin(self, payload: bytes) -> None:
+    async def _feed_stdin(self, payload: bytes, previous: Optional[asyncio.Task]) -> None:
         assert self._proc is not None and self._proc.stdin is not None
+        if previous is not None and not previous.done():
+            with contextlib.suppress(BaseException):
+                await previous
         stdin = self._proc.stdin
         try:
             async with asyncio.timeout(self.stdin_timeout_s):
@@ -232,11 +328,9 @@ class AgySession:
             self._writer_error = Error(message=message)
             self._available.set()
             # A blocked/failed writer must also stop the upstream process.
+            self.kill_now()
             if self._close_task is None:
                 self._close_task = asyncio.create_task(self._close_impl())
-        finally:
-            with contextlib.suppress(Exception):
-                stdin.close()
 
     async def _read_stdout(self) -> None:
         assert self._proc is not None and self._proc.stdout is not None
@@ -255,6 +349,8 @@ class AgySession:
                     break
                 if not raw:
                     break
+                self._got_line = True
+                self._started.set()
                 line = raw.decode("utf-8", "replace")
                 ev = parse_line(line)
                 if ev is not None:
@@ -266,6 +362,7 @@ class AgySession:
                     self.raw_tail.append(line.strip()[:500])
         finally:
             self._eof = True
+            self._started.set()
             self._available.set()
 
     async def _read_stderr(self) -> None:
@@ -285,31 +382,49 @@ class AgySession:
 
     # ── reading ───────────────────────────────────────────────────────────—
 
+    def inject(self, item: object) -> None:
+        """Push a non-stdout item (an MCP PendingCall) into the event stream."""
+        self._injected.append(item)
+        self._available.set()
+
     def push_back(self, ev: Union[ChatEvent, object]) -> None:
-        """Return an already-popped event to the front of the stream."""
+        """Return an already-popped event to the front of the stream (FIFO
+        among pushed-back items)."""
         self._pushback.append(ev)
+
+    def _take_nowait(self) -> Union[ChatEvent, object, None]:
+        if self._writer_error is not None:
+            error, self._writer_error = self._writer_error, None
+            return error
+        if self._pushback:
+            return self._pushback.popleft()
+        if not self._queue.empty():
+            return self._queue.get_nowait()
+        if self._injected:
+            return self._injected.popleft()
+        if self._eof or self._closed:
+            return STREAM_CLOSED
+        return None
 
     async def next_event(
         self, timeout: Optional[float] = None
     ) -> Union[ChatEvent, object, None]:
-        """Pop the next event. Returns :data:`STREAM_CLOSED` at EOF, or ``None``
-        if ``timeout`` elapses first."""
-        async def take():
-            while True:
-                if self._writer_error is not None:
-                    error, self._writer_error = self._writer_error, None
-                    return error
-                if self._pushback:
-                    return self._pushback.pop(0)
-                if not self._queue.empty():
-                    return self._queue.get_nowait()
-                if self._eof or self._closed:
-                    return STREAM_CLOSED
-                self._available.clear()
-                await self._available.wait()
+        """Pop the next item: a ChatEvent, an injected item, or
+        :data:`STREAM_CLOSED` at EOF. Returns ``None`` if ``timeout`` elapses
+        first. The fast path (something already queued) arms no timer."""
+        item = self._take_nowait()
+        if item is not None:
+            return item
+        if timeout is not None and timeout <= 0:
+            return None
         try:
             async with asyncio.timeout(timeout):
-                return await take()
+                while True:
+                    self._available.clear()
+                    item = self._take_nowait()
+                    if item is not None:
+                        return item
+                    await self._available.wait()
         except TimeoutError:
             return None
 
@@ -320,14 +435,51 @@ class AgySession:
             parts.append("stdout: " + " | ".join(self.raw_tail))
         if self.stderr_tail:
             parts.append("stderr: " + " | ".join(self.stderr_tail))
+        if self._proc is not None and self._proc.returncode is not None:
+            parts.append(f"exit code {self._proc.returncode}")
         return "; ".join(parts) if parts else "no diagnostics captured"
 
     # ── shutdown ──────────────────────────────────────────────────────────—
 
-    async def aclose(self) -> None:
-        """Finish shared teardown even if callers are repeatedly cancelled."""
+    def kill_now(self) -> None:
+        """Issue the kill SYNCHRONOUSLY (no await) — the one teardown step that
+        must happen even while the caller is being cancelled. Idempotent.
+
+        POSIX: SIGKILL to the whole process group (agy + its children).
+        Windows: start ``taskkill /PID <pid> /T /F`` without waiting for it (a
+        tree kill; TerminateProcess on the leader alone orphans agy's
+        children). Reaping is left to :meth:`aclose`."""
+        proc = self._proc
+        if proc is None or proc.returncode is not None:
+            return
+        if os.name == "nt":
+            if self._killer is None:
+                try:
+                    self._killer = subprocess.Popen(
+                        ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                    )
+                except OSError:
+                    with contextlib.suppress(OSError):
+                        proc.kill()
+            return
+        self._signal_owned(signal.SIGKILL)
+
+    async def aclose(self, *, graceful: bool = False) -> None:
+        """Stop the process and its reader tasks; finish the shared teardown
+        even if callers are repeatedly cancelled.
+
+        ``graceful`` (an IDLE process between turns): close stdin and give agy
+        a moment to exit 0 on its own. Otherwise (abort mid-turn — agy has no
+        per-turn cancel) the kill is issued synchronously, before any await, so
+        a cancellation landing right now cannot leave the process alive."""
+        if not graceful and self._close_task is None:
+            self.kill_now()
         with anyio.CancelScope(shield=True):
             if self._close_task is None:
+                self._graceful_close = graceful
                 self._close_task = asyncio.create_task(self._close_impl())
             cancelled = False
             while True:
@@ -341,32 +493,117 @@ class AgySession:
             if cancelled:
                 raise asyncio.CancelledError
 
-    def _signal_owned(self, sig: int) -> None:
+    def _signal_owned(self, sig: int, *, group_seen_alive: bool = False) -> None:
+        """POSIX: signal the whole process group (agy + its children).
+
+        Once the leader has exited and been reaped, its pgid is only ours while
+        some member of the group survives — after that the kernel may hand the
+        number to an unrelated new session. So the group is signalled only
+        while the leader is alive, or when the caller observed it alive during
+        this very teardown (``group_seen_alive``: the leader was alive when
+        teardown began, or :meth:`_orphaned_group_alive` just found members of
+        the group — lingering children pin the id)."""
         try:
-            if self._pgid is not None:
+            leader_alive = self._proc is not None and self._proc.returncode is None
+            if self._pgid is not None and (leader_alive or group_seen_alive):
                 os.killpg(self._pgid, sig)
             elif self._proc is not None and self._proc.returncode is None:
                 self._proc.send_signal(sig)
-        except ProcessLookupError:
+        except (ProcessLookupError, PermissionError):
             pass
+
+    def _orphaned_group_alive(self) -> bool:
+        """Linux: our leader is gone — do members of its process group (agy's
+        orphaned children) still exist? While one does, the kernel cannot
+        recycle the pgid, so it is still ours. A live process whose PID equals
+        the pgid is NOT ours (our leader was reaped): that number was recycled,
+        so the answer is no. Without /proc (other POSIX) the group is never
+        signalled after the leader exited."""
+        pgid = self._pgid
+        if pgid is None or not os.path.isdir("/proc"):
+            return False
+        members = False
+        try:
+            entries = os.listdir("/proc")
+        except OSError:
+            return False
+        for name in entries:
+            if not name.isdigit():
+                continue
+            try:
+                with open(f"/proc/{name}/stat", "rb") as f:
+                    fields = f.read().rsplit(b")", 1)[1].split()
+            except (OSError, IndexError):
+                continue
+            # After "(comm)": state ppid pgrp session ...
+            if int(name) == pgid:
+                return False
+            if len(fields) > 2 and fields[2] == str(pgid).encode():
+                members = True
+        return members
+
+    async def _kill_tree_windows(self, proc: asyncio.subprocess.Process) -> None:
+        """Windows has no process groups or SIGTERM for console apps
+        (``send_signal(SIGTERM)`` is TerminateProcess on the leader only, which
+        orphans agy's children). ``taskkill /T /F`` walks the tree from the
+        leader — so it must run while the leader is still alive. The Popen is
+        synchronous so a cancellation cannot interrupt it half-way; its exit is
+        then awaited off-loop."""
+        if proc.returncode is None and self._killer is None:
+            try:
+                self._killer = subprocess.Popen(
+                    ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+            except OSError:
+                logger.warning("taskkill unavailable; killing the agy leader only", exc_info=True)
+        if self._killer is not None:
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                await asyncio.to_thread(self._killer.wait, 10)
+        if proc.returncode is None:
+            # Already gone (ProcessLookupError) or access denied while exiting.
+            with contextlib.suppress(OSError):
+                proc.kill()
 
     async def _close_impl(self) -> None:
         self._closed = True
         self._available.set()
-        tasks = [t for t in (self._reader_task, self._stderr_task, self._stdin_task)
-                 if t is not None]
-        for task in tasks:
-            task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
-        proc = self._proc
-        if proc is not None:
-            self._signal_owned(signal.SIGTERM)
-            try:
-                await asyncio.wait_for(proc.wait(), timeout=5)
-            except asyncio.TimeoutError:
-                pass
-            finally:
+        try:
+            proc = self._proc
+            # The leader was alive when teardown began: the group id is still
+            # ours for the final group SIGKILL below (see _signal_owned).
+            seen_alive = proc is not None and (proc.returncode is None
+                                               or self._orphaned_group_alive())
+            if (self._graceful_close and proc is not None and proc.returncode is None
+                    and self._killer is None and proc.stdin is not None):
+                # Graceful: EOF on stdin ends agy's read loop; it exits 0.
+                with contextlib.suppress(Exception):
+                    proc.stdin.close()
+                with contextlib.suppress(TimeoutError):
+                    async with asyncio.timeout(_GRACEFUL_EXIT_S):
+                        await proc.wait()
+            tasks = [t for t in (self._reader_task, self._stderr_task, self._stdin_task)
+                     if t is not None]
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            if proc is not None and os.name == "nt":
+                await self._kill_tree_windows(proc)
+                await proc.wait()
+            elif proc is not None:
+                if proc.returncode is None:
+                    self._signal_owned(signal.SIGTERM)
+                    try:
+                        await asyncio.wait_for(proc.wait(), timeout=5)
+                    except asyncio.TimeoutError:
+                        pass
                 # The leader may already have exited while descendants remain.
-                self._signal_owned(signal.SIGKILL)
+                # Skipped when it was already gone before teardown: that pgid
+                # may have been recycled by now.
+                self._signal_owned(signal.SIGKILL, group_seen_alive=seen_alive)
                 self._pgid = None
-            await proc.wait()
+                await proc.wait()
+        finally:
+            self.closed_event.set()

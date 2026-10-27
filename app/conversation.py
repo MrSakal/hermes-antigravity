@@ -1,64 +1,124 @@
-"""ConversationManager — reconciles stateless OpenAI requests with stateful,
-suspendable agy turns for the tool-passthrough path.
+"""ConversationManager — maps stateless OpenAI requests onto PERSISTENT agy
+processes: one session pool for every chat request, with or without tools.
 
-A *conversation* owns one live ``agy`` subprocess (the current turn), its
-:class:`~app.mcp_bridge.ConversationBridge`, and a server *slot* — its own entry
-(``hermes``, ``hermes2``, …) in the shared Antigravity MCP config pointing at
-``/mcp/<conv_id>``. It moves through:
+A *conversation* owns one live ``agy`` stdin-mode process (see
+:mod:`app.agy_session`) and its :class:`~app.mcp_bridge.ConversationBridge`.
+When the request has tools, its MCP server is declared in the managed agent
+file the process boots with (``inheritMcp: false`` + one ``mcpServers`` entry
+``hermes-<toolset sha8>`` → ``/mcp/<conv_id>``, see :mod:`app.agent_config`);
+the shared ``~/.gemini/config/mcp_config.json`` is never written. States:
 
-    RUNNING ── tool calls ──▶ SUSPENDED ──(next request resolves results)──▶ RUNNING
-            └────────────── clean result ──────────────▶ CLOSED
+    RUNNING ── hermes tool calls ──▶ SUSPENDED ──(tool results)──▶ RUNNING
+       │
+       ├── final text ──▶ IDLE ──(next user message matches)──▶ RUNNING
+       └── error / timeout / disconnect / process death ──▶ CLOSED
 
-Request classification (same as hermes-claude):
+Request classification:
 
-* **Continuation** — the message list ends with one or more ``tool`` results,
-  matched to a suspended conversation by ``tool_call_id``. Resolving the pending
-  Futures lets the agy subprocess — still blocked inside our MCP ``call_tool``
-  — resume; no new turn is spawned.
-* **Fresh turn** — otherwise: allocate conv_id + slot, register the bridge, add
-  the config entry, spawn ``agy -p`` with the folded history.
+* **Continuation** — the message list ends with ``tool`` results, matched to a
+  SUSPENDED conversation by ``tool_call_id``. Resolving the pending Futures
+  lets the agy process — still blocked inside our MCP ``call_tool`` — resume.
+  A dead suspended process is a plain expiry (rebuildable from the transcript
+  the continuation carries); a live conversation that is not waiting on these
+  ids, or ids whose results were already delivered (a bounded memory of
+  recently completed ``tool_call_id``s), is a :class:`DuplicateContinuation`
+  — 409, never rebuilt, because a rebuild re-runs the turn and its effects.
+* **New turn** — otherwise. Cross-turn reuse: after a turn ends with final
+  text its process is parked IDLE under ``key = H(spawn signature +
+  normalized history incl. the assistant text exactly as returned to the
+  client)``. A request whose ``messages[:-1]`` hash to an IDLE key adopts that
+  process and sends ONLY the newest user message. If the process is gone
+  (LRU-evicted, idle TTL, crashed) but its agy conversation id is known (a
+  *dormant* record), a new process resumes it with ``--conversation`` and
+  again gets only the newest message. Anything else starts fresh — adopting
+  a pre-booted warm-pool process when one matches — with the whole history
+  folded into the first turn. A miss is always safe; it only costs a boot.
 
-agy difference vs claude: tool calls surface on our MCP endpoint (the bridge
-queue), not as a distinct stdout event we must pair with the queue — so
-``run_turn`` waits on the stdout event queue and the bridge's incoming queue
-simultaneously and treats a PendingCall arrival as the suspend trigger.
+This subsumes the old history-prefix → conversation-id cache (``convcache``):
+dormant records ARE that cache, keyed by the same history key as the IDLE
+processes, single-use (a claim consumes the record, so a stale prefix can
+never resume a conversation that has since moved on).
+
+The spawn signature is (model, workdir, agent template digest, toolset hash,
+preamble-system hash): a process may only serve a request that would have
+spawned an identical one, because model, agent body and MCP server are fixed
+per process. agy has no per-turn cancel, so a turn abandoned mid-flight
+(client disconnect, request timeout) kills its process — a process whose
+history diverged from what the client saw is never parked for reuse.
 """
 
 from __future__ import annotations
 
 import asyncio
-
+import hashlib
+import json
 import logging
 import time
+from collections import Counter, OrderedDict
 from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional, Union
+from typing import Any, Optional, Union
 
 import anyio
 
-from app.agent_config import AgentPluginManager
+from app.agent_config import (
+    AgentPluginManager,
+    AgentUnavailable,
+    McpServerSpec,
+    SpawnBusy,
+    SpawnFailed,
+    agent_digest,
+    render_agent,
+    server_name_for,
+    toolset_hash,
+)
 from app.agy_session import STREAM_CLOSED, AgySession
 from app.config import PromptTooLarge, Settings, check_prompt_size
 from app.errors import OpenAIError
 from app.events import Error, Init, TextDelta, ToolStep, TurnDone
 from app.mcp_bridge import ConversationBridge, McpBridge, PendingCall, tool_signature
-from app.mcp_config import McpConfigManager
 from app.openai_models import ChatCompletionRequest, ChatMessage
+from app.textfilter import OutputFilter
 from app.thinking import TurnThinking, default_brain_path
 from app.translate import (
     build_prompt,
     materialize_messages,
     message_text,
+    message_text_with_images,
     split_system,
     usage_from_turn,
 )
+from app.warmpool import Signature, WarmPool, new_conv_id
 
 logger = logging.getLogger("agi.conv")
 
 RUNNING = "running"
 SUSPENDED = "suspended"
+IDLE = "idle"  # turn complete, process parked alive for cross-turn reuse
+CLOSING = "closing"  # detached from every index, teardown pending
 CLOSED = "closed"
+
+# How long a ``--conversation`` resume waits for the previous process of the
+# same agy conversation to finish exiting before giving up on the resume (and
+# starting fresh instead — a miss is always safe, two writers are not).
+_DORMANT_EXIT_WAIT_S = 15.0
+
+# A RUNNING conversation whose turn loop never started (the response was never
+# consumed — e.g. the client vanished before the first byte) is reaped by GC
+# after this long instead of the full request timeout.
+_UNDRIVEN_TTL_S = 30.0
+
+# A conversation detached for teardown (CLOSING) whose teardown never started
+# — its owner was cancelled first — is reaped by GC after this long.
+_CLOSING_GRACE_S = 10.0
+
+# Parallel tool calls of one assistant step arrive within this window.
+_BATCH_GRACE_S = 0.15
+
+# The thinking transcript is polled (a stat() per poll) at most this often
+# while text streams; turn boundaries always poll.
+_THINKING_POLL_S = 0.25
 
 
 # ── turn-loop chunks (rendered to SSE / JSON by the chat route) ─────────────—
@@ -66,6 +126,9 @@ CLOSED = "closed"
 
 @dataclass
 class TextChunk:
+    """Assistant text, already post-processed (segment seams, table
+    flattening) — exactly what the client receives."""
+
     text: str
 
 
@@ -88,8 +151,7 @@ class ErrorChunk:
 
 @dataclass
 class ToolBoundaryChunk:
-    """Marks an internal (builtin) tool use between two assistant text
-    segments. Carries no text; the route uses it to insert a blank-line seam."""
+    """Legacy marker (seams are now applied inside the turn loop)."""
 
 
 @dataclass
@@ -111,8 +173,8 @@ TurnChunk = Union[
 @dataclass
 class Conversation:
     conv_id: str
-    slot: str  # server name in the shared MCP config ("hermes", "hermes2", …)
-    session: AgySession
+    slot: Optional[str]  # MCP server name in the agent file; None = no tools
+    session: Any  # AgySession (or a test double)
     bridge: ConversationBridge
     model: str
     state: str = RUNNING
@@ -120,48 +182,122 @@ class Conversation:
     last_activity: float = field(default_factory=time.monotonic)
     workdir: Optional[Path] = None
     release_resources: Callable[[], None] | None = None
+    signature: str = ""
+    # The message list of the request currently being served — with the final
+    # assistant text it becomes the history key when the turn parks IDLE.
+    current_msgs: list[ChatMessage] = field(default_factory=list)
+    reuse_key: Optional[str] = None
+    # Set when run_turn starts consuming the current turn (see _UNDRIVEN_TTL_S).
+    driven: bool = False
+    # Bumped on every claim (fresh / reuse / resume): request-scoped cleanup
+    # only touches the turn it started, never a later one on the same process.
+    turn_token: int = 0
+    # Monotonic time it was detached for teardown (state CLOSING).
+    closing_since: Optional[float] = None
     _close_task: Optional[asyncio.Task] = field(default=None, init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        # One event stream for the turn loop: bridge calls join stdout events.
+        inject = getattr(self.session, "inject", None)
+        if inject is not None:
+            self.bridge.attach(inject)
 
     def touch(self) -> None:
         self.last_activity = time.monotonic()
 
 
+@dataclass
+class _Dormant:
+    """A remembered agy conversation whose process is gone (or going).
+    ``gone`` is the old session's ``closed_event``: set once that process has
+    fully exited, so a resume never runs concurrently with its predecessor."""
+
+    agy_id: str
+    gone: asyncio.Event
+    stored_at: float = field(default_factory=time.monotonic)
+
+
 class ExpiredContinuation(Exception):
-    """A continuation whose tool_call_ids match no suspended conversation."""
+    """A continuation whose tool_call_ids match no live suspended conversation."""
 
 
 class DuplicateContinuation(ExpiredContinuation):
-    """A continuation for a conversation that is alive but not waiting on these
-    ids — a second copy of a turn already claimed. Never rebuilt: the first copy
-    is (or was) running it."""
+    """A second copy of a continuation: its conversation is alive but not
+    waiting on these ids, or their results were already delivered. Never
+    rebuilt — the first copy is (or was) answering it, and a rebuild would
+    re-run the turn and its side effects. Still renders as 409."""
+
+
+# ── history keys ────────────────────────────────────────────────────────────
+
+
+def _norm_message(m: ChatMessage) -> list[Any]:
+    """One message, normalized for history matching.
+
+    User/tool content is compared verbatim; list content (images included) is
+    serialized whole, so two histories differing only in an attached image
+    never collide. Assistant text is compared whitespace-stripped (clients
+    commonly trim it) and tool calls by id + name only (argument JSON gets
+    re-serialized by clients)."""
+    if m.role == "assistant":
+        calls = [[tc.id or "", tc.function.name or ""] for tc in (m.tool_calls or [])]
+        return ["assistant", message_text(m).strip(), calls]
+    c = m.content
+    content = json.dumps(c, sort_keys=True, ensure_ascii=False) if isinstance(c, list) else (c or "")
+    return [m.role, content, m.tool_call_id or "", m.name or ""]
+
+
+def history_key(signature: str, messages: list[ChatMessage]) -> str:
+    """Reuse key: spawn signature + normalized non-system history."""
+    norm = [_norm_message(m) for m in messages if m.role != "system"]
+    payload = json.dumps([signature, norm], ensure_ascii=False)
+    return hashlib.sha256(payload.encode("utf-8", "surrogatepass")).hexdigest()
+
+
+def _has_images(messages: list[ChatMessage]) -> bool:
+    return any(isinstance(m.content, list) and any(
+        isinstance(p, dict) and p.get("type") == "image_url" for p in m.content)
+        for m in messages)
+
+
+# ── manager ─────────────────────────────────────────────────────────────────
 
 
 class ConversationManager:
     def __init__(
         self,
         mcp: McpBridge,
-        mcp_config: McpConfigManager,
         settings: Settings,
         agents: Optional[AgentPluginManager] = None,
+        pool: Optional[WarmPool] = None,
     ) -> None:
         self.mcp = mcp
-        self.mcp_config = mcp_config
         self.settings = settings
         self.agents = agents
+        self.pool = pool
+        self._brain = settings.agy_brain_path or default_brain_path()
         self._conversations: dict[str, Conversation] = {}
         self._pending_index: dict[str, str] = {}  # tool_call_id -> conv_id
+        self._idle: dict[str, str] = {}  # history key -> conv_id (IDLE convs)
+        # history key -> agy conversation id of a process that is gone.
+        self._dormant: "OrderedDict[str, _Dormant]" = OrderedDict()
+        # tool_call_id -> monotonic time its result was delivered.
+        self._completed: "OrderedDict[str, float]" = OrderedDict()
         self._lock = asyncio.Lock()
         self._counter = 0
+        self._tokens = 0
+        self._spawning = 0
+        # Teardowns detached from a cancelled caller (strong refs).
+        self._background: set[asyncio.Task] = set()
+        # reuse_hits / reuse_misses / dormant_resumes / dormant_lost /
+        # pool_adopted / duplicates_rejected / evictions
+        self.stats: Counter = Counter()
 
     # ── classification ───────────────────────────────────────────────────—
 
     @staticmethod
     def is_continuation(req: ChatCompletionRequest) -> bool:
-        for m in reversed(req.messages):
-            if m.role == "tool":
-                return True
-            return False
-        return False
+        return bool(req.messages) and req.messages[-1].role == "tool"
 
     @staticmethod
     def _trailing_tool_messages(req: ChatCompletionRequest) -> list[ChatMessage]:
@@ -174,44 +310,81 @@ class ConversationManager:
         out.reverse()
         return out
 
-    # ── creation (fresh turn) ─────────────────────────────────────────────—
+    # ── ids / urls ────────────────────────────────────────────────────────—
 
     def _next_conv_id(self) -> str:
         self._counter += 1
-        return f"conv{self._counter}-{int(time.time())}"
+        return new_conv_id("conv", self._counter)
+
+    def _next_token(self) -> int:
+        self._tokens += 1
+        return self._tokens
 
     def _mcp_url(self, conv_id: str) -> str:
         return f"http://127.0.0.1:{self.settings.port}/mcp/{conv_id}"
 
-    async def create(
-        self,
-        req: ChatCompletionRequest,
-        *,
-        model: str,
-        workdir: Path,
-    ) -> Conversation:
-        convo, system = split_system(req.messages)
-        self._check_size(build_prompt(convo, system, inject_system=True))
-        agent = None
-        if self.settings.system_prompt_via_agent and self.agents is not None:
-            # Tool turns need call_mcp_tool, which only `tools: "*"` grants
-            # (see agent_config) — hence tool_turn_tools, not plain_chat_tools.
-            agent = await self.agents.ensure_agent(
-                system, tools_mode=self.settings.tool_turn_tools
-            )
-        if self.settings.image_input:
-            convo = materialize_messages(convo, workdir)
-        # No agent (mode off, or plugin dir unwritable) → automatic fallback:
-        # the system message rides as an instruction preamble instead.
-        content = build_prompt(convo, system, inject_system=agent is None)
-        if not content.strip():
-            raise OpenAIError("no user content in messages", status_code=400, param="messages")
+    # ── turn planning ─────────────────────────────────────────────────────—
 
-        # Nudge the model toward its slot: the schema cache the CLI injects
-        # names the server, but an explicit hint removes ambiguity. Built before
-        # the slot is allocated so a size rejection leaves no side effects; the
-        # slot name is a short token, so the cap is checked against the body.
-        tool_names = ", ".join(t.function.name for t in (req.tools or []))
+    def _agent_unavailable(self) -> OpenAIError:
+        return OpenAIError(
+            "cannot install the managed agent that carries the system prompt / "
+            "tool allowlist / tool server", status_code=503, code="agent_unavailable",
+        )
+
+    def plan(self, req: ChatCompletionRequest, *, model: str, workdir: Path
+             ) -> tuple[Signature, list[ChatMessage], Optional[str], bool]:
+        """(signature, non-system messages, system prompt, inject_system)."""
+        s = self.settings
+        convo, system = split_system(req.messages)
+        tools = list(req.tools or [])
+        via_agent = s.system_prompt_via_agent
+
+        def agents_ok() -> bool:  # lazy: "no agent" configs never touch the dir
+            return self.agents is not None and self.agents.available()
+        render = None
+        agent_md: Optional[str] = None
+        server: Optional[str] = None
+        if tools:
+            # The MCP server reaches agy only through the agent file, so a
+            # tool turn without a writable plugin directory fails closed.
+            if not agents_ok():
+                raise self._agent_unavailable()
+            server = server_name_for(tools)
+            body = system if via_agent else None
+
+            def render(conv_id: str, _body=body, _server=server) -> str:
+                return render_agent(
+                    _body, tools_mode=s.tool_turn_tools, name=self.agents.agent_name,
+                    servers=[McpServerSpec(_server, self._mcp_url(conv_id))],
+                    inherit_mcp=s.inherit_user_mcp,
+                )
+            template = agent_digest(render("<conv>"))
+        else:
+            if via_agent or s.plain_chat_tools != "all":
+                if agents_ok():
+                    agent_md = render_agent(
+                        system if via_agent else None, tools_mode=s.plain_chat_tools,
+                        name=self.agents.agent_name,
+                        inherit_mcp=s.inherit_user_mcp,
+                    )
+                elif s.plain_chat_tools != "all":
+                    raise self._agent_unavailable()
+            template = agent_digest(agent_md) if agent_md is not None else None
+        # No agent (mode off, or plugin dir unwritable) → the system message
+        # rides as an instruction preamble instead.
+        inject_system = bool(system) and (template is None or not via_agent)
+        extra = hashlib.sha256((system or "").encode("utf-8", "surrogatepass")).hexdigest()[:16] \
+            if inject_system else ""
+        if s.image_input:
+            extra += ":img"
+        sig = Signature(
+            model=model, workdir=str(workdir.resolve()), agent=template, agent_md=agent_md,
+            tools_key=toolset_hash(tools) if tools else "", extra=extra, render=render,
+            tools=tuple(tools), server=server,
+        )
+        return sig, convo, system, inject_system
+
+    def _check_size(self, content: str) -> None:
         try:
             check_prompt_size(content, self.settings)
         except PromptTooLarge as e:
@@ -219,80 +392,317 @@ class ConversationManager:
                 f"prompt is {e.nbytes} UTF-8 bytes; the server cap is {e.cap} "
                 "(AGI_MAX_PROMPT_BYTES). Shorten the conversation.",
                 status_code=400, type="invalid_request_error", code="context_length_exceeded",
-            )
+            ) from e
 
-        async with self._lock:
-            conv_id = self._next_conv_id()
-        bridge = ConversationBridge(
-            conv_id, req.tools or [],
-            max_pending_tool_calls=self.settings.max_pending_tool_calls,
-        )
-        slot = None
-        session = None
-        allocation = None
-        try:
-            self.mcp.register(bridge)
-            # Finish slot allocation even if the caller is cancelled, so rollback
-            # always knows which owned slot must be removed.
-            allocation = asyncio.create_task(
-                self.mcp_config.add_conversation(conv_id, self._mcp_url(conv_id))
-            )
-            slot = await asyncio.shield(allocation)
-            hint = (
-                f"\n\n[External functions are available on the MCP server "
-                f"'{slot}' via the call_mcp_tool tool: {tool_names}. Use them when needed.]"
-            )
-            session = AgySession(
-                agy_bin=self.settings.agy_bin, model=model, workdir=workdir,
-                prompt=content + (hint if tool_names else ""), agent=agent,
-                print_timeout_s=self.settings.request_timeout_s + self.settings.suspended_ttl_s,
-                disable_slash_commands=self.settings.disable_slash_commands,
-                timing_log=self.settings.timing_log, timing_label="tool",
-                event_queue_size=self.settings.event_queue_size,
-                stdin_timeout_s=self.settings.stdin_timeout_s,
-            )
-            await session.start()
-            brain = self.settings.agy_brain_path or default_brain_path()
-            conv = Conversation(conv_id=conv_id, slot=slot, session=session,
-                                bridge=bridge, model=model, workdir=workdir.resolve(),
-                                thinking=TurnThinking(brain))
-            async with self._lock:
-                self._conversations[conv_id] = conv
-        except BaseException:
-            async def rollback():
-                nonlocal slot
-                try:
-                    if allocation is not None:
-                        try:
-                            slot = await allocation
-                        except BaseException:
-                            pass
-                    bridge.fail_all("conversation creation failed")
-                    self._conversations.pop(conv_id, None)
-                    await self.mcp.close_conversation(conv_id)
-                finally:
+    async def _turn_text(self, msg: ChatMessage, workdir: Path) -> str:
+        if self.settings.image_input and _has_images([msg]):
+            return await asyncio.to_thread(message_text_with_images, msg, workdir)
+        return message_text(msg)
+
+    # ── new turn (reuse / resume / fresh) ─────────────────────────────────—
+
+    async def start_turn(
+        self, req: ChatCompletionRequest, *, model: str, workdir: Path,
+        deadline: Optional[float] = None,
+    ) -> Conversation:
+        """Start the turn for a non-continuation request (or a rebuilt one);
+        returns the conversation, claimed RUNNING, whose :meth:`run_turn`
+        yields the answer. ``deadline`` (event-loop time) bounds the wait for
+        the agent-spawn queue: a queue that would outlast it fails fast (503)."""
+        if not req.messages:
+            raise OpenAIError("messages must not be empty", status_code=400, param="messages")
+        sig, convo, system, inject_system = self.plan(req, model=model, workdir=workdir)
+        key_sig = sig.key
+
+        last = req.messages[-1]
+        if last.role == "user" and len(convo) > 1:
+            newest = await self._turn_text(last, workdir)
+            # Validate BEFORE claiming: a claimed IDLE process must get its turn.
+            if newest.strip():
+                self._check_size(newest)
+                key = history_key(key_sig, req.messages[:-1])
+                conv, dormant = await self._claim_idle(key)
+                if conv is not None:
                     try:
-                        if slot is not None:
-                            await self.mcp_config.remove_conversation(slot)
-                    finally:
-                        if session is not None:
-                            await session.aclose()
-            try:
-                await self._finish_cleanup(rollback())
-            except BaseException:
-                logger.exception("conv=%s rollback failed", conv_id)
-            raise
-        logger.info("conv=%s created (slot=%s, model=%s, %d tools)",
-                    conv_id, slot, model, len(req.tools or []))
+                        conv.session.send(newest)
+                    except RuntimeError:
+                        # Died between the liveness check and the write.
+                        agy_id = getattr(conv.session, "conversation_id", None)
+                        await self._abort(conv)
+                        if agy_id:
+                            dormant = _Dormant(agy_id, conv.session.closed_event)
+                    except BaseException:
+                        await self._abort(conv)
+                        raise
+                    else:
+                        conv.current_msgs = list(req.messages)
+                        self.stats["reuse_hits"] += 1
+                        logger.info("conv=%s REUSED (sent newest message only, %d prior msgs)",
+                                    conv.conv_id, len(req.messages) - 1)
+                        return conv
+                if dormant is not None and await self._predecessor_gone(dormant):
+                    logger.info("resuming agy conversation %s in a new process", dormant.agy_id)
+                    conv = await self._spawn(req, sig, text=newest, resume_id=dormant.agy_id,
+                                             deadline=deadline)
+                    if conv is not None:
+                        self.stats["dormant_resumes"] += 1
+                        return conv
+                    # agy lost that conversation: fall through to a full fold.
+                self.stats["reuse_misses"] += 1
+
+        if self.settings.image_input and _has_images(convo):
+            convo = await asyncio.to_thread(materialize_messages, convo, workdir)
+        content = build_prompt(convo, system, inject_system=inject_system)
+        if not content.strip():
+            raise OpenAIError("no user content in messages", status_code=400, param="messages")
+        if req.tools:
+            names = ", ".join(t.function.name for t in req.tools)
+            # Nudge the model toward its server: the schema cache the CLI
+            # injects names the server, an explicit hint removes ambiguity.
+            content += (f"\n\n[External functions are available on the MCP server "
+                        f"'{sig.server}' via the call_mcp_tool tool: {names}. "
+                        "Use them when needed.]")
+        self._check_size(content)
+        conv = await self._spawn(req, sig, text=content, deadline=deadline)
+        assert conv is not None
         return conv
+
+    # Older name of the fresh-turn entry point (tool turns only, pre-WP2).
+    create = start_turn
+
+    async def _claim_idle(
+        self, key: str
+    ) -> tuple[Optional[Conversation], Optional[_Dormant]]:
+        """Claim the IDLE conversation parked under ``key`` (→ RUNNING), or
+        return the dormant record to resume when its process is gone.
+
+        Everything that hands out an agy conversation id happens under the
+        lock — a dead IDLE conversation is detached right there — so two
+        concurrent identical requests cannot both resume the same agy
+        conversation in two processes."""
+        dead: Optional[Conversation] = None
+        async with self._lock:
+            cid = self._idle.get(key)
+            conv = self._conversations.get(cid) if cid else None
+            if conv is not None and conv.state == IDLE:
+                if getattr(conv.session, "running", False):
+                    self._idle.pop(key, None)
+                    conv.reuse_key = None
+                    conv.state = RUNNING
+                    conv.driven = False
+                    conv.turn_token = self._next_token()
+                    conv.touch()
+                    return conv, None
+                dead = conv  # crashed while parked
+                self._retire_locked(dead, dormant=True)
+            dormant = self._dormant.pop(key, None)
+            if dormant is not None and time.monotonic() - dormant.stored_at > self.settings.conversation_cache_ttl_s:
+                dormant = None
+        if dead is not None:
+            await self._close(dead)
+        return None, dormant
+
+    @staticmethod
+    async def _predecessor_gone(dormant: _Dormant) -> bool:
+        """Wait (briefly) until the previous process of ``dormant`` exited.
+        Eviction / GC detach a conversation before its graceful teardown has
+        finished; resuming before that would run two agy processes on one
+        conversation. On timeout the caller starts fresh instead."""
+        if dormant.gone.is_set():
+            return True
+        try:
+            async with asyncio.timeout(_DORMANT_EXIT_WAIT_S):
+                await dormant.gone.wait()
+            return True
+        except TimeoutError:
+            logger.warning("previous process of agy conversation %s still exiting after "
+                           "%.0fs; starting fresh instead of resuming",
+                           dormant.agy_id, _DORMANT_EXIT_WAIT_S)
+            return False
+
+    async def _spawn(
+        self, req: ChatCompletionRequest, sig: Signature, *, text: str,
+        resume_id: Optional[str] = None, deadline: Optional[float] = None,
+    ) -> Optional[Conversation]:
+        """Start ``text`` on a new process: a warm-pool adoption, a cold spawn,
+        or (``resume_id``) a ``--conversation`` resume. Returns ``None`` when agy
+        answered the resume with a NEW conversation (its DB was pruned/lost) —
+        the caller then folds the full history instead."""
+        tools = list(req.tools or [])
+        s = self.settings
+        evicted = await self._make_room()
+        entry = None
+        session = None
+        bridge: Optional[ConversationBridge] = None
+        conv_id = ""
+        conv: Optional[Conversation] = None
+        try:
+            if resume_id is None and self.pool is not None:
+                entry = await self.pool.acquire(sig)
+            if entry is not None:
+                conv_id, session = entry.conv_id, entry.session
+                bridge = entry.bridge
+                if bridge is None:
+                    bridge = ConversationBridge(conv_id, tools,
+                                                max_pending_tool_calls=s.max_pending_tool_calls)
+                else:
+                    # Late-bind before the first message (agy lists tools at
+                    # its lazy MCP connect, which that message triggers).
+                    bridge.bind_tools(tools)
+            else:
+                conv_id = self._next_conv_id()
+                bridge = ConversationBridge(conv_id, tools,
+                                            max_pending_tool_calls=s.max_pending_tool_calls)
+                session = AgySession(
+                    agy_bin=s.agy_bin, model=sig.model, workdir=sig.workdir,
+                    # A fresh turn's prompt rides from the start; a resume
+                    # first checks agy kept the conversation (see below).
+                    prompt=None if resume_id else text,
+                    conversation_id=resume_id, print_timeout_s=0,
+                    disable_slash_commands=s.disable_slash_commands,
+                    timing_log=s.timing_log,
+                    timing_label="resume" if resume_id else ("tool" if tools else "fresh"),
+                    event_queue_size=s.event_queue_size, stdin_timeout_s=s.stdin_timeout_s,
+                )
+            try:
+                if entry is None:
+                    if tools:
+                        self.mcp.register(bridge)
+                    content = sig.agent_for(conv_id)
+                    if content is not None:
+                        budget = None if deadline is None else (
+                            deadline - asyncio.get_running_loop().time())
+                        try:
+                            await self.agents.spawn(session, content, budget_s=budget)
+                        except AgentUnavailable as e:
+                            raise self._agent_unavailable() from e
+                        except SpawnBusy as e:
+                            raise OpenAIError(
+                                f"agy spawn queue is full ({e}); retry shortly",
+                                status_code=503, type="server_error", code="spawn_queue_full",
+                            ) from e
+                        except SpawnFailed as e:
+                            raise OpenAIError(str(e), status_code=502, type="upstream_error",
+                                              code="upstream_start_failed") from e
+                    else:
+                        await session.start()
+                if resume_id is not None and await self._lost_conversation(session, resume_id):
+                    self.stats["dormant_lost"] += 1
+                    await self._finish_cleanup(self._rollback(conv_id, session, bridge))
+                    return None
+                conv = Conversation(
+                    conv_id=conv_id, slot=sig.server, session=session, bridge=bridge,
+                    model=sig.model, workdir=Path(sig.workdir), signature=sig.key,
+                    current_msgs=list(req.messages), turn_token=self._next_token(),
+                )
+                async with self._lock:
+                    self._conversations[conv_id] = conv
+                if entry is not None or resume_id is not None:
+                    try:
+                        session.send(text)
+                    except RuntimeError as e:
+                        # The adopted / resumed process died before its first
+                        # message: an upstream failure, not a server bug.
+                        raise OpenAIError(f"agy exited before the turn started ({e})",
+                                          status_code=502, type="upstream_error",
+                                          code="upstream_exited") from e
+            except BaseException:
+                if conv is not None:
+                    async with self._lock:
+                        self._conversations.pop(conv_id, None)
+                try:
+                    await self._finish_cleanup(self._rollback(conv_id, session, bridge))
+                except BaseException:
+                    logger.exception("conv=%s rollback failed", conv_id)
+                raise
+        finally:
+            # Synchronous (no await): a cancellation landing here must neither
+            # leak the spawn slot nor strand the evicted victims CLOSING.
+            self._spawning -= 1
+            if evicted:
+                await self._close_detached(evicted, max_sessions=s.max_sessions)
+        if entry is not None:
+            self.stats["pool_adopted"] += 1
+        logger.info("conv=%s %s (model=%s, %d tools, resume=%s)", conv_id,
+                    "adopted from warm pool" if entry is not None else "spawned",
+                    sig.model, len(tools), resume_id)
+        return conv
+
+    async def _close_detached(self, victims: list[Conversation], *, max_sessions: int) -> None:
+        """Close LRU-evicted victims in a task of their own, so the teardown
+        completes even when the awaiting caller is cancelled (the cancellation
+        still propagates to the caller)."""
+        async def run() -> None:
+            for victim in victims:
+                logger.info("conv=%s evicted (LRU idle, max_sessions=%d)",
+                            victim.conv_id, max_sessions)
+                try:
+                    await self._close(victim, graceful=True)
+                except Exception:
+                    logger.exception("conv=%s eviction teardown failed", victim.conv_id)
+        task = asyncio.create_task(run(), name="agi-evict")
+        self._background.add(task)
+        task.add_done_callback(self._background.discard)
+        await asyncio.shield(task)
+
+    async def _rollback(self, conv_id: str, session: Any, bridge: Optional[ConversationBridge]) -> None:
+        try:
+            if bridge is not None:
+                bridge.fail_all("conversation creation failed")
+            await self.mcp.close_conversation(conv_id)
+        finally:
+            if session is not None:
+                await session.aclose()
+
+    async def _lost_conversation(self, session: Any, resume_id: str) -> bool:
+        """agy answers a ``--conversation`` resume of a pruned/lost DB with a
+        NEW conversation (stderr warning only; verified on 1.1.27) — its boot
+        ``init`` line then carries a different id. Checked before the message
+        is sent, so a lost resume costs one boot, never a wrong answer."""
+        first = await session.next_event(timeout=self.settings.agent_start_timeout_s)
+        if first is None:
+            raise OpenAIError("upstream startup timeout", status_code=504, type="timeout_error")
+        if isinstance(first, Init) and first.conversation_id and first.conversation_id != resume_id:
+            logger.warning("agy could not resume %s (got %s); folding full history instead",
+                           resume_id, first.conversation_id)
+            return True
+        session.push_back(first)
+        return False
+
+    async def _make_room(self) -> list[Conversation]:
+        """Detach LRU IDLE processes so a new spawn stays within max_sessions;
+        returns them for the caller to tear down. Busy (RUNNING/SUSPENDED)
+        processes are never killed for room — admission bounds those."""
+        async with self._lock:
+            self._spawning += 1
+            live = [c for c in self._conversations.values() if c.state not in (CLOSED, CLOSING)]
+            excess = len(live) + self._spawning - max(1, self.settings.max_sessions)
+            if excess <= 0:
+                return []
+            idle = sorted((c for c in live if c.state == IDLE), key=lambda c: c.last_activity)
+            victims = idle[:excess]
+            for v in victims:
+                self._retire_locked(v, dormant=True)
+            self.stats["evictions"] += len(victims)
+        return victims
 
     # ── resume (continuation) ─────────────────────────────────────────────—
 
-    def _check_size(self, content: str) -> None:
-        try:
-            check_prompt_size(content, self.settings)
-        except PromptTooLarge as exc:
-            raise OpenAIError(str(exc), status_code=400, code="context_length_exceeded") from exc
+    def _prune_completed_locked(self) -> None:
+        horizon = time.monotonic() - self.settings.completed_call_memory_s
+        while self._completed and next(iter(self._completed.values())) < horizon:
+            self._completed.popitem(last=False)
+
+    def _remember_completed_locked(self, ids: list[str]) -> None:
+        cap = self.settings.completed_call_memory_max
+        if cap <= 0:
+            return
+        now = time.monotonic()
+        for tid in ids:
+            self._completed[tid] = now
+            self._completed.move_to_end(tid)
+        while len(self._completed) > cap:
+            self._completed.popitem(last=False)
 
     async def resume(
         self, req: ChatCompletionRequest, *, model: Optional[str] = None,
@@ -305,7 +715,14 @@ class ConversationManager:
         if not ids or any(not tid for tid in ids) or len(set(ids)) != len(ids):
             raise ExpiredContinuation("continuation requires unique, nonempty tool_call_ids")
 
+        dead: Optional[Conversation] = None
         async with self._lock:
+            self._prune_completed_locked()
+            if (any(self._pending_index.get(tid) is None for tid in ids)
+                    and any(tid in self._completed for tid in ids)):
+                self.stats["duplicates_rejected"] += 1
+                raise DuplicateContinuation(
+                    "these tool results were already delivered; the turn is not re-run")
             owners = {self._pending_index.get(tid) for tid in ids}
             if len(owners) != 1 or None in owners:
                 if any(self._pending_index.get(tid) for tid in ids):
@@ -316,36 +733,52 @@ class ConversationManager:
                 if conv is not None:
                     raise DuplicateContinuation("conversation is not waiting on these tool results")
                 raise ExpiredContinuation("tool results reference an expired or unknown conversation")
-            indexed = {tid for tid, cid in self._pending_index.items() if cid == conv.conv_id}
-            if set(ids) != indexed or set(ids) != set(conv.bridge.pending_ids):
-                raise DuplicateContinuation("continuation must supply every pending tool result exactly once")
-            if req.model is not None and (model if model is not None else req.model) != conv.model:
-                raise ExpiredContinuation("continuation model does not match the suspended conversation")
-            if req.workdir is not None:
-                candidate = Path(workdir if workdir is not None else req.workdir).expanduser().resolve()
-                if conv.workdir is None or candidate != conv.workdir:
-                    raise ExpiredContinuation("continuation workdir does not match the suspended conversation")
-            if req.tools is not None and tool_signature(req.tools) != conv.bridge.signature:
-                raise ExpiredContinuation("continuation tools schema does not match the suspended conversation")
-            # All validation and result preparation precedes the first mutation.
-            conv.state = RUNNING
-            conv.touch()
-            for tid, result in results:
-                self._pending_index.pop(tid)
-                conv.bridge.resolve(tid, result)
+            if not getattr(conv.session, "running", True):
+                # Died while waiting for these results: nobody is answering
+                # this turn, so it is a plain expiry (rebuildable).
+                dead = conv
+                self._retire_locked(conv, dormant=False)
+            else:
+                indexed = {tid for tid, cid in self._pending_index.items() if cid == conv.conv_id}
+                if set(ids) != indexed or set(ids) != set(conv.bridge.pending_ids):
+                    raise DuplicateContinuation("continuation must supply every pending tool result exactly once")
+                if req.model is not None and (model if model is not None else req.model) != conv.model:
+                    raise ExpiredContinuation("continuation model does not match the suspended conversation")
+                if req.workdir is not None:
+                    candidate = Path(workdir if workdir is not None else req.workdir).expanduser().resolve()
+                    if conv.workdir is None or candidate != conv.workdir:
+                        raise ExpiredContinuation("continuation workdir does not match the suspended conversation")
+                if req.tools is not None and tool_signature(req.tools) != conv.bridge.signature:
+                    raise ExpiredContinuation("continuation tools schema does not match the suspended conversation")
+                # All validation and result preparation precedes the first mutation.
+                conv.state = RUNNING
+                conv.driven = False
+                conv.turn_token = self._next_token()
+                conv.current_msgs = list(req.messages)
+                conv.touch()
+                for tid, result in results:
+                    self._pending_index.pop(tid)
+                    conv.bridge.resolve(tid, result)
+                self._remember_completed_locked(ids)
+        if dead is not None:
+            logger.info("conv=%s died while suspended", dead.conv_id)
+            await self._close(dead)
+            raise ExpiredContinuation(
+                "the agy process waiting for these tool results has exited")
         logger.info("conv=%s resumed (%d tool results)", conv.conv_id, len(results))
         return conv
 
     async def resume_or_rebuild(
         self, req: ChatCompletionRequest, *, model: str, workdir: Path,
         before_create: Optional[Callable[[], Awaitable[None]]] = None,
+        deadline: Optional[float] = None,
     ) -> Conversation:
         """:meth:`resume`, or — when the suspended conversation is gone and
-        ``settings.rebuild_on_expiry`` — a fresh :meth:`create` from the full
-        history the stateless client resent. The transcript already carries the
+        ``settings.rebuild_on_expiry`` — a fresh turn from the full history the
+        stateless client resent. The transcript already carries the
         assistant's tool_calls and the tool results, so the model produces the
         next turn as it would have; only the 409 the client could not retry is
-        avoided. Ported from schmarta/claude-code-openai-server.
+        avoided. Duplicates are never rebuilt.
 
         ``before_create`` runs only on the rebuild path — the route uses it to
         acquire the session permit a plain resume does not need."""
@@ -360,131 +793,242 @@ class ConversationManager:
                         model, len(req.messages))
             if before_create is not None:
                 await before_create()
-            return await self.create(req, model=model, workdir=workdir)
+            return await self.start_turn(req, model=model, workdir=workdir, deadline=deadline)
 
     # ── turn loop ─────────────────────────────────────────────────────────—
 
     async def run_turn(self, conv: Conversation) -> AsyncIterator[TurnChunk]:
-        """Yield chunks until the turn suspends on tool calls or completes.
+        """Yield chunks until the turn suspends on tool calls, completes, or fails.
 
-        Waits on BOTH the subprocess stdout events and the bridge's incoming
-        PendingCall queue: with agy, a hermes tool call manifests as an HTTP
-        ``call_tool`` on our bridge (the stdout ``tool`` step for it may arrive
-        before, after, or not at all while blocked), so the queue is the
-        authoritative suspend trigger.
-        """
-        deadline = asyncio.get_running_loop().time() + self.settings.request_timeout_s
-        saw_text = False
+        One stream carries agy's stdout events AND the bridge's PendingCalls
+        (the bridge injects into the session), so a hermes tool call — an HTTP
+        ``call_tool`` on our bridge — is just another item in arrival order; no
+        per-event task is created.
+
+        Terminal bookkeeping (park IDLE / SUSPENDED, or close) happens BEFORE
+        the terminal chunk is yielded: the consumer stops iterating on it, and
+        code after that yield would only run at generator finalization."""
+        session = conv.session
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self.settings.request_timeout_s
+        filt = OutputFilter(flatten_tables=self.settings.flatten_markdown_tables)
+        thinking = TurnThinking(self._brain, getattr(session, "conversation_id", None))
+        emitted: list[str] = []
+        last_poll = 0.0
+        conv.driven = True
         try:
             while True:
-                remaining = deadline - asyncio.get_running_loop().time()
+                remaining = deadline - loop.time()
                 if remaining <= 0:
                     raise TimeoutError
-                ev = await asyncio.wait_for(self._next_event_or_call(conv, remaining), remaining)
-                if conv.thinking is not None:
-                    if isinstance(ev, Init):
-                        conv.thinking.on_init(ev.conversation_id)
-                    for block in conv.thinking.poll():
+                ev = await session.next_event(timeout=remaining)
+                conv.touch()
+                if isinstance(ev, Init):
+                    self._learn_id(session, ev.conversation_id)
+                    thinking.on_init(ev.conversation_id)
+                now = loop.time()
+                if (ev is None or ev is STREAM_CLOSED or now - last_poll >= _THINKING_POLL_S
+                        or isinstance(ev, (Init, TurnDone, PendingCall, Error))):
+                    last_poll = now
+                    for block in thinking.poll():
                         yield ReasoningChunk(block)
+
                 if ev is None:
-                    await self._close(conv)
-                    yield ErrorChunk("upstream timeout", status_code=504)
-                    return
+                    raise TimeoutError
                 if isinstance(ev, PendingCall):
-                    batch = [ev]
-                    remaining = deadline - asyncio.get_running_loop().time()
-                    if remaining <= 0:
-                        raise TimeoutError
-                    batch.extend(await asyncio.wait_for(conv.bridge.drain_incoming(grace_s=0.15), remaining))
+                    if ev.future.done():
+                        continue  # failed / answered while queued — stale
+                    batch = [ev] + await self._drain_batch(conv, deadline)
                     batch = [pc for pc in batch if not pc.future.done()]
+                    if loop.time() >= deadline:
+                        raise TimeoutError
                     if not batch:
                         continue
-                    async with asyncio.timeout_at(deadline):
-                        async with self._lock:
-                            at_capacity = sum(c.state == SUSPENDED for c in self._conversations.values()) >= self.settings.max_suspended_sessions
-                            if not at_capacity:
-                                for pc in batch:
-                                    self._pending_index[pc.id] = conv.conv_id
-                                conv.state = SUSPENDED
+                    async with self._lock:
+                        at_capacity = sum(c.state == SUSPENDED for c in self._conversations.values()) \
+                            >= self.settings.max_suspended_sessions
+                        if not at_capacity and conv.state == RUNNING:
+                            for pc in batch:
+                                self._pending_index[pc.id] = conv.conv_id
+                            conv.state = SUSPENDED
                     if at_capacity:
                         await self._close(conv)
                         yield ErrorChunk("suspended conversation capacity exceeded", status_code=503)
                         return
                     conv.touch()
+                    tail = filt.flush()
                     logger.info("conv=%s suspended on %d tool call(s)", conv.conv_id, len(batch))
+                    if tail:
+                        yield TextChunk(tail)
                     yield ToolCallsChunk(batch)
-                    return  # park SUSPENDED; subprocess blocked in call_tool
+                    return  # parked SUSPENDED; process blocked in call_tool
                 if ev is STREAM_CLOSED:
-                    # Close BEFORE yielding: the consumer may break out of its
-                    # async-for on a terminal chunk, and code after that yield
-                    # would never run (GeneratorExit).
+                    # stdin mode: EOF means the process died mid-turn — there is
+                    # no result line, so whatever text arrived is a TRUNCATED
+                    # answer. Flush it (a streaming client already holds part of
+                    # it) but report the failure: "stop" here would pass a
+                    # cut-off reply off as complete.
+                    tail = filt.flush()
+                    diag_fn = getattr(session, "diagnostics", None)
+                    diag = diag_fn() if diag_fn else "no diagnostics captured"
                     await self._close(conv)
-                    yield ErrorChunk("upstream closed without TurnDone", status_code=502)
+                    if tail:
+                        yield TextChunk(tail)
+                    if ("".join(emitted) + tail).strip():
+                        yield ErrorChunk(f"agy exited mid-turn ({diag})", status_code=502)
+                    else:
+                        yield ErrorChunk(f"agy produced no result ({diag})", status_code=502)
                     return
                 if isinstance(ev, TextDelta):
-                    saw_text = saw_text or bool(ev.text)
-                    yield TextChunk(ev.text)
+                    out = filt.feed(ev.text)
+                    if out:
+                        emitted.append(out)
+                        yield TextChunk(out)
                 elif isinstance(ev, ToolStep):
-                    if ev.matches_server(conv.slot):
+                    if conv.slot and ev.matches_server(conv.slot):
                         # Companion stdout event of a bridge call; the queue
-                        # handles suspension — nothing to surface.
+                        # item handles suspension — nothing to surface.
                         continue
                     if ev.state == "ACTIVE":
                         logger.debug("conv=%s internal tool: %s", conv.conv_id, ev.tool_name)
-                        yield ToolBoundaryChunk()
-                    continue
+                        filt.tool_boundary()
                 elif isinstance(ev, TurnDone):
-                    usage = usage_from_turn(ev)
-                    await self._close(conv)
-                    if not saw_text and ev.response_text:
-                        yield TextChunk(ev.response_text)
-                    yield DoneChunk("stop", usage)
+                    self._learn_id(session, ev.conversation_id)
+                    tail = filt.flush()
+                    if not ("".join(emitted) + tail).strip() and ev.response_text:
+                        # No deltas captured: the result line carries the text.
+                        tail += filt.feed(ev.response_text) + filt.flush()
+                    if tail:
+                        emitted.append(tail)
+                    await self._park_or_close(conv, "".join(emitted))
+                    if tail:
+                        yield TextChunk(tail)
+                    yield DoneChunk("stop", usage_from_turn(ev))
                     return
                 elif isinstance(ev, Error):
-                    message = ev.message
                     await self._close(conv)
-                    yield ErrorChunk(message, status_code=502)
+                    yield ErrorChunk(ev.message, status_code=502)
                     return
                 # Init / others: ignore.
         except TimeoutError:
             await self._close(conv)
             yield ErrorChunk("upstream timeout", status_code=504)
         except BaseException:
-            if conv.state != SUSPENDED:
-                await self._close(conv)
+            # Abandoned mid-turn (client disconnect / cancellation) or failed on
+            # a bug: agy has no per-turn cancel and this process' history now
+            # diverges from what the client saw — kill it (a no-op once the
+            # turn parked or closed).
+            if conv.state == RUNNING:
+                await self._abort(conv)
             raise
 
-    async def _next_event_or_call(
-        self, conv: Conversation, timeout: float
-    ) -> Union[object, PendingCall, None]:
-        """Race the stdout event queue against the bridge's incoming calls."""
-        ev_task = asyncio.create_task(conv.session.next_event(timeout=timeout))
-        call_task = asyncio.create_task(conv.bridge.next_incoming(timeout=timeout))
-        try:
-            done, pending = await asyncio.wait(
-                {ev_task, call_task}, return_when=asyncio.FIRST_COMPLETED
-            )
-        finally:
-            for task in (ev_task, call_task):
-                if not task.done():
-                    task.cancel()
-            with anyio.CancelScope(shield=True):
-                await asyncio.gather(ev_task, call_task, return_exceptions=True)
-        # Prefer a PendingCall when both completed together.
-        if call_task in done:
-            call = call_task.result()
-            if call is not None:
-                # Don't lose a simultaneously-completed stdout event.
-                if ev_task in done:
-                    ev = ev_task.result()
-                    if ev is not None:
-                        conv.session.push_back(ev)
-                return call
-        if ev_task in done:
-            return ev_task.result()
-        return None
+    @staticmethod
+    def _learn_id(session: Any, conversation_id: Optional[str]) -> None:
+        if conversation_id and getattr(session, "conversation_id", None) is None:
+            session.conversation_id = conversation_id
+
+    async def _drain_batch(self, conv: Conversation, deadline: float) -> list[PendingCall]:
+        """Collect further calls of a parallel batch arriving within
+        ``_BATCH_GRACE_S`` (never past the turn deadline). Non-call items seen
+        meanwhile are pushed back, in order, for the turn loop."""
+        loop = asyncio.get_running_loop()
+        end = min(loop.time() + _BATCH_GRACE_S, deadline)
+        batch: list[PendingCall] = []
+        others: list[Any] = []
+        while True:
+            remaining = end - loop.time()
+            if remaining <= 0:
+                break
+            item = await conv.session.next_event(timeout=remaining)
+            if item is None:
+                break
+            if isinstance(item, PendingCall):
+                batch.append(item)
+                continue
+            others.append(item)
+            if item is STREAM_CLOSED:
+                break
+        for item in others:
+            conv.session.push_back(item)
+        return batch
+
+    # ── park for reuse ────────────────────────────────────────────────────—
+
+    async def _park_or_close(self, conv: Conversation, final_text: str) -> None:
+        """After a clean turn end: park the live process IDLE under the history
+        it has now processed (request messages + this reply as the client got
+        it), so a matching next turn can adopt it. Otherwise close — and, if the
+        agy conversation id is known, remember it dormant for a resume."""
+        s = self.settings
+        session = conv.session
+        key = None
+        if final_text.strip():
+            key = history_key(conv.signature, list(conv.current_msgs) + [
+                ChatMessage(role="assistant", content=final_text)])
+        if (s.session_reuse and key is not None and getattr(session, "running", False)
+                and not conv.bridge.pending_ids):
+            replaced: Optional[Conversation] = None
+            async with self._lock:
+                if conv.state == RUNNING:
+                    prev = self._idle.get(key)
+                    if prev and prev != conv.conv_id:
+                        replaced = self._conversations.get(prev)
+                        if replaced is not None:
+                            self._retire_locked(replaced, dormant=False)
+                    conv.state = IDLE
+                    conv.reuse_key = key
+                    self._idle[key] = conv.conv_id
+                    self._dormant.pop(key, None)
+                    for tid in [t for t, c in self._pending_index.items() if c == conv.conv_id]:
+                        self._pending_index.pop(tid, None)
+            if conv.state == IDLE:
+                conv.touch()
+                release, conv.release_resources = conv.release_resources, None
+                if release is not None:
+                    release()
+                logger.info("conv=%s parked IDLE for reuse", conv.conv_id)
+            if replaced is not None:
+                await self._close(replaced, graceful=True)
+            if conv.state == IDLE:
+                return
+        agy_id = getattr(session, "conversation_id", None)
+        await self._close(conv, graceful=bool(getattr(session, "running", False)))
+        if key is not None and agy_id and s.conversation_cache_max > 0:
+            gone = getattr(session, "closed_event", None)
+            if gone is None:
+                gone = asyncio.Event()
+                gone.set()
+            async with self._lock:
+                self._remember_dormant_locked(key, agy_id, gone)
 
     # ── teardown ──────────────────────────────────────────────────────────—
+
+    def _retire_locked(self, conv: Conversation, *, dormant: bool) -> None:
+        """Detach ``conv`` from the reuse index (caller holds the lock) so no
+        request can claim it while its teardown is pending; remember its agy
+        conversation as dormant when asked."""
+        key = conv.reuse_key
+        if key:
+            if self._idle.get(key) == conv.conv_id:
+                self._idle.pop(key, None)
+            agy_id = getattr(conv.session, "conversation_id", None)
+            gone = getattr(conv.session, "closed_event", None)
+            if dormant and agy_id and gone is not None:
+                self._remember_dormant_locked(key, agy_id, gone)
+        conv.reuse_key = None
+        if conv.state != CLOSED:
+            conv.state = CLOSING
+            if conv.closing_since is None:
+                conv.closing_since = time.monotonic()
+
+    def _remember_dormant_locked(self, key: str, agy_id: str, gone: asyncio.Event) -> None:
+        cap = self.settings.conversation_cache_max
+        if cap <= 0:
+            return
+        self._dormant[key] = _Dormant(agy_id, gone)
+        self._dormant.move_to_end(key)
+        while len(self._dormant) > cap:
+            self._dormant.popitem(last=False)
 
     @staticmethod
     async def _finish_cleanup(awaitable):
@@ -499,20 +1043,20 @@ class ConversationManager:
                         break
             return task.result()
 
-    async def _close(self, conv: Conversation) -> None:
+    async def _close(self, conv: Conversation, *, graceful: bool = False) -> None:
         if conv._close_task is None:
-            conv._close_task = asyncio.create_task(self._close_with_resources(conv))
+            conv._close_task = asyncio.create_task(self._close_with_resources(conv, graceful))
         await self._finish_cleanup(conv._close_task)
 
-    async def _close_with_resources(self, conv: Conversation) -> None:
+    async def _close_with_resources(self, conv: Conversation, graceful: bool) -> None:
         try:
-            await self._close_impl(conv)
+            await self._close_impl(conv, graceful)
         finally:
             release, conv.release_resources = conv.release_resources, None
             if release is not None:
                 release()
 
-    async def _close_impl(self, conv: Conversation) -> None:
+    async def _close_impl(self, conv: Conversation, graceful: bool) -> None:
         if conv.state == CLOSED:
             return
         conv.state = CLOSED
@@ -521,40 +1065,108 @@ class ConversationManager:
         finally:
             try:
                 async with self._lock:
-                    self._conversations.pop(conv.conv_id, None)
+                    if self._conversations.get(conv.conv_id) is conv:
+                        self._conversations.pop(conv.conv_id, None)
+                    if conv.reuse_key and self._idle.get(conv.reuse_key) == conv.conv_id:
+                        self._idle.pop(conv.reuse_key, None)
                     stale = [tid for tid, cid in self._pending_index.items() if cid == conv.conv_id]
                     for tid in stale:
                         self._pending_index.pop(tid, None)
                 await self.mcp.close_conversation(conv.conv_id)
             finally:
-                try:
-                    await self.mcp_config.remove_conversation(conv.slot)
-                finally:
+                if graceful:
+                    await conv.session.aclose(graceful=True)
+                else:
                     await conv.session.aclose()
         logger.info("conv=%s closed", conv.conv_id)
 
+    async def _abort(self, conv: Conversation) -> None:
+        """Kill-close that survives cancellation of the caller: the kill is
+        issued synchronously before the first await, and bookkeeping + teardown
+        run shielded, so a second cancel (or a disconnect landing mid-teardown)
+        cannot leave a live process behind."""
+        kill = getattr(conv.session, "kill_now", None)
+        if kill is not None:
+            kill()
+        await self._close(conv)
+
+    async def abandon(self, conv: Conversation, token: Optional[int] = None) -> None:
+        """The response for ``conv``'s current turn will never be consumed
+        (client gone, cancellation, a failure after the claim): kill it unless
+        it already reached a parked state. ``token`` pins the turn — a later
+        turn already claimed on the same process is never touched."""
+        if conv.state == RUNNING and (token is None or token == conv.turn_token):
+            await self._abort(conv)
+
     async def close_all(self) -> None:
         for conv in list(self._conversations.values()):
-            await self._close(conv)
+            try:
+                await self._close(conv, graceful=conv.state == IDLE)
+            except Exception:  # keep going: one stuck process must not leak the rest
+                logger.exception("conv=%s close failed", conv.conv_id)
+
+    async def evict_idle(self) -> int:
+        """Shut down every IDLE process now (kept resumable as dormant)."""
+        async with self._lock:
+            victims = [c for c in self._conversations.values() if c.state == IDLE]
+            for v in victims:
+                self._retire_locked(v, dormant=True)
+        for v in victims:
+            await self._close(v, graceful=True)
+        return len(victims)
+
+    # ── introspection (metrics / tests) ───────────────────────────────────—
+
+    def count(self, state: Optional[str] = None) -> int:
+        if state is None:
+            return sum(c.state not in (CLOSED, CLOSING) for c in self._conversations.values())
+        return sum(c.state == state for c in self._conversations.values())
 
     # ── garbage collection ────────────────────────────────────────────────—
 
     async def gc_once(self) -> int:
-        """Reap conversations whose TTL elapsed. Returns the count closed."""
+        """Reap conversations whose TTL elapsed. Returns the count closed.
+
+        * SUSPENDED past ``suspended_ttl_s`` (the client never returned its tool
+          results): killed.
+        * IDLE past ``idle_session_ttl_s`` (or dead): shut down gracefully but
+          remembered dormant, so a late follow-up still resumes it.
+        * RUNNING untouched for longer than a request may take — or whose turn
+          loop never started within ``_UNDRIVEN_TTL_S`` (claimed, but the
+          response was never consumed): killed."""
         now = time.monotonic()
-        susp_ttl = self.settings.suspended_ttl_s
-        idle_ttl = self.settings.idle_session_ttl_s
-        victims: list[Conversation] = []
+        s = self.settings
+        victims: list[tuple[Conversation, bool]] = []
         async with self._lock:
             for conv in list(self._conversations.values()):
                 age = now - conv.last_activity
-                if conv.state == SUSPENDED and age > susp_ttl:
-                    victims.append(conv)
-                elif age > idle_ttl:
-                    victims.append(conv)
-        for conv in victims:
-            logger.info("conv=%s GC (state=%s)", conv.conv_id, conv.state)
-            await self._close(conv)
+                if conv.state == SUSPENDED and age > s.suspended_ttl_s:
+                    victims.append((conv, False))
+                elif conv.state == IDLE and (age > s.idle_session_ttl_s
+                                             or not getattr(conv.session, "running", False)):
+                    self._retire_locked(conv, dormant=True)
+                    victims.append((conv, True))
+                elif conv.state == RUNNING and (
+                        age > s.request_timeout_s + 60
+                        or (not conv.driven and age > _UNDRIVEN_TTL_S)):
+                    victims.append((conv, False))
+                elif (conv.state == CLOSING and conv._close_task is None
+                      and conv.closing_since is not None
+                      and now - conv.closing_since > _CLOSING_GRACE_S):
+                    # Detached for teardown by a caller that was cancelled
+                    # before it could close it: nobody else will.
+                    victims.append((conv, True))
+            horizon = now - s.conversation_cache_ttl_s
+            for key in [k for k, d in self._dormant.items() if d.stored_at < horizon]:
+                self._dormant.pop(key, None)
+            self._prune_completed_locked()
+        for conv, idle in victims:
+            logger.info("conv=%s GC (%s)", conv.conv_id,
+                        "idle" if idle and conv.state != CLOSING else conv.state)
+            try:
+                await self._close(conv, graceful=idle)
+            except Exception:  # pragma: no cover - defensive
+                logger.exception("conv=%s GC teardown failed", conv.conv_id)
         return len(victims)
 
     async def gc_loop(self) -> None:

@@ -16,25 +16,23 @@ from typing import Literal, Optional
 from pydantic import Field, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-# Static fallback catalog — what `agy models` reported on 1.1.27 (Gemini 3.5
-# is gone: the CLI rejects it with "invalid model selection"). The live catalog
-# (app.model_catalog.ModelCatalog, refreshed from `agy models`) is authoritative
-# whenever it has loaded; this table only matters when the CLI cannot be queried
-# (offline, not signed in) and for unit tests.
+# Static fallback catalog — what `agy models` reports on 1.4.8. The live
+# catalog (app.model_catalog.ModelCatalog, refreshed from `agy models`) is
+# authoritative whenever it has loaded; this table only matters when the CLI
+# cannot be queried (offline, not signed in) and for unit tests.
 KNOWN_MODELS = [
-    "Gemini 3.8 Flash (Medium)",
+    "Gemini 4 Argon (Medium)",
+    "Gemini 4 Argon (High)",
+    "Gemini 4 Argon (Low)",
     "Gemini 3.8 Flash (High)",
+    "Gemini 3.8 Flash (Medium)",
     "Gemini 3.8 Flash (Low)",
-    "Gemini 3.7 Flash (Medium)",
-    "Gemini 3.7 Flash (High)",
-    "Gemini 3.7 Flash (Low)",
-    "Gemini 3.6 Flash (Medium)",
-    "Gemini 3.6 Flash (High)",
-    "Gemini 3.6 Flash (Low)",
-    "Gemini 3.1 Pro (Low)",
-    "Gemini 3.1 Pro (High)",
-    "Claude Sonnet 4.6 (Thinking)",
-    "Claude Opus 4.6 (Thinking)",
+    "Claude Opus 5.5 (Low)",
+    "Claude Opus 5.5 (Medium)",
+    "Claude Opus 5.5 (High)",
+    "Claude Sonnet 5.5 (Low)",
+    "Claude Sonnet 5.5 (Medium)",
+    "Claude Sonnet 5.5 (High)",
     "GPT-OSS 120B (Medium)",
 ]
 
@@ -42,27 +40,26 @@ KNOWN_MODELS = [
 # (`agy models` column 1 minus the -low/-medium/-high suffix) so the static and
 # live tables have the same shape. Single-variant models use the "" key.
 _FAMILY_VARIANTS: dict[str, dict[str, str]] = {
+    "gemini-4-argon": {
+        "low": "Gemini 4 Argon (Low)",
+        "medium": "Gemini 4 Argon (Medium)",
+        "high": "Gemini 4 Argon (High)",
+    },
     "gemini-3.8-flash": {
         "low": "Gemini 3.8 Flash (Low)",
         "medium": "Gemini 3.8 Flash (Medium)",
         "high": "Gemini 3.8 Flash (High)",
     },
-    "gemini-3.7-flash": {
-        "low": "Gemini 3.7 Flash (Low)",
-        "medium": "Gemini 3.7 Flash (Medium)",
-        "high": "Gemini 3.7 Flash (High)",
+    "claude-opus-5-5": {
+        "low": "Claude Opus 5.5 (Low)",
+        "medium": "Claude Opus 5.5 (Medium)",
+        "high": "Claude Opus 5.5 (High)",
     },
-    "gemini-3.6-flash": {
-        "low": "Gemini 3.6 Flash (Low)",
-        "medium": "Gemini 3.6 Flash (Medium)",
-        "high": "Gemini 3.6 Flash (High)",
+    "claude-sonnet-5-5": {
+        "low": "Claude Sonnet 5.5 (Low)",
+        "medium": "Claude Sonnet 5.5 (Medium)",
+        "high": "Claude Sonnet 5.5 (High)",
     },
-    "gemini-3.1-pro": {
-        "low": "Gemini 3.1 Pro (Low)",
-        "high": "Gemini 3.1 Pro (High)",
-    },
-    "claude-sonnet-4-6": {"": "Claude Sonnet 4.6 (Thinking)"},
-    "claude-opus-4-6-thinking": {"": "Claude Opus 4.6 (Thinking)"},
     "gpt-oss-120b": {"medium": "GPT-OSS 120B (Medium)"},
 }
 
@@ -70,16 +67,39 @@ _FAMILY_VARIANTS: dict[str, dict[str, str]] = {
 _ALIASES: dict[str, str] = {
     "gemini-flash": "gemini-3.8-flash",
     "flash": "gemini-3.8-flash",
-    "gemini-pro": "gemini-3.1-pro",
-    "pro": "gemini-3.1-pro",
-    "claude-sonnet": "claude-sonnet-4-6",
-    "claude-sonnet-4.6": "claude-sonnet-4-6",
-    "sonnet": "claude-sonnet-4-6",
-    "claude-opus": "claude-opus-4-6-thinking",
-    "claude-opus-4.6": "claude-opus-4-6-thinking",
-    "claude-opus-4-6": "claude-opus-4-6-thinking",
-    "opus": "claude-opus-4-6-thinking",
+    "argon": "gemini-4-argon",
+    "gemini-argon": "gemini-4-argon",
+    "gemini": "gemini-4-argon",
+    "claude-sonnet": "claude-sonnet-5-5",
+    "claude-sonnet-5.5": "claude-sonnet-5-5",
+    "sonnet": "claude-sonnet-5-5",
+    "claude-opus": "claude-opus-5-5",
+    "claude-opus-5.5": "claude-opus-5-5",
+    "opus": "claude-opus-5-5",
+    "claude": "claude-opus-5-5",
     "gpt-oss": "gpt-oss-120b",
+}
+
+# Short aliases → keywords matched against the families the catalog actually
+# has, first family in agy's order wins. Used when the alias table above points
+# at a family the live catalog no longer lists (agy 1.4.8 replaced Gemini 3.1
+# Pro and Claude 4.6 with Gemini 4 Argon / Claude 5.5) — so "sonnet" follows
+# the current Sonnet without a code change. Only consulted after an exact
+# display name / slug / family match failed, so it never shadows a real id.
+_ALIAS_KEYWORDS: dict[str, tuple[str, ...]] = {
+    "argon": ("argon",),
+    "gemini-argon": ("argon",),
+    "gemini": ("argon", "gemini"),
+    "flash": ("flash",),
+    "gemini-flash": ("flash",),
+    "pro": ("pro",),
+    "gemini-pro": ("pro",),
+    "sonnet": ("sonnet",),
+    "claude-sonnet": ("sonnet",),
+    "opus": ("opus",),
+    "claude-opus": ("opus",),
+    "claude": ("opus", "claude"),
+    "gpt-oss": ("gpt-oss",),
 }
 
 
@@ -137,37 +157,54 @@ class Settings(BaseSettings):
     disable_slash_commands: bool = True
 
     # ── System prompt via managed agent ─────────────────────────────────────
-    # Deliver the request's system message as a REAL system prompt: materialize
-    # it as an agent definition (agents/hermes-<hash>.md) inside a server-managed
-    # plugin and spawn agy with --agent <slug>. Verified against agy 1.1.4: the
-    # agent body overrides the CLI's built-in persona, agent files are discovered
-    # at conversation start with no install step, and the agent stays in effect
-    # across --conversation resumes. When disabled, the system message uses a
-    # preamble. Restricted plain-chat modes still require a neutral agent and
+    # Deliver the request's system message as a REAL system prompt: write it
+    # into the ONE managed agent file (plugins/hermes-bridge/agents/hermes.md)
+    # and spawn agy with --agent hermes. Verified against agy 1.4.8: the body
+    # overrides the CLI's built-in persona and is read at process boot, before
+    # the first stdout line — every spawn holds a lock from the write until that
+    # line (see app/agent_config.py), so concurrent requests never see each
+    # other's prompt. The file is rewritten only when its bytes change. When
+    # disabled, the system message uses a preamble. Restricted plain-chat modes
+    # and tool turns still need the agent (tool allowlist / MCP server) and
     # fail closed (503) if the plugin cannot be written.
     system_prompt_via_agent: bool = True
     # Managed plugin directory (never touches other plugins). Override for tests.
     agent_plugin_path: Optional[Path] = None
-    # Max generated agent files kept (LRU by mtime); older ones are pruned.
-    agent_cache_max: int = 64
+    # Name of the managed agent (``agents/<name>.md``, ``--agent <name>``). A
+    # second server on the same HOME must use its own plugin path AND name —
+    # two plugins defining one agent name make ``--agent`` ambiguous.
+    agent_name: str = Field(default="hermes", pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+    # Max wait for a spawned agy's first stdout line (proof it read the agent
+    # file) while holding the agent-file lock. On timeout the process is killed
+    # and the request fails 504 — a slow agy must never read the next spawn's
+    # file. Boot is ~1-3 s; this only bounds a hung CLI, which blocks every
+    # other spawn for this long — so it is kept short. A request whose spawn
+    # queue would outlast its own deadline fails fast with 503.
+    agent_start_timeout_s: float = Field(default=30.0, gt=0)
+    # Let agy also see the user's own MCP servers from the shared
+    # ~/.gemini/config/mcp_config.json (agent frontmatter `inheritMcp`). Off by
+    # default: tool turns then see exactly one MCP server (this conversation's
+    # hermes functions) and plain chat sees none.
+    inherit_user_mcp: bool = False
 
     # ── Builtin-tool exposure (security) ────────────────────────────────────
     # agy runs under --dangerously-skip-permissions, so every builtin it can
     # reach (run_command, write_to_file, browser, …) is arbitrary code
     # execution as this user — driven by whatever the request contains,
     # including untrusted web pages / tool outputs a client asks to summarize.
-    # Verified against 1.1.27: the agent frontmatter `tools:` list IS honored
-    # as an allowlist (["view_file"] leaves only view_file + manage_task;
-    # `tools: []` leaves none). `call_mcp_tool` can NOT be listed explicitly
-    # (the agent fails to start) — it is granted by `tools: "*"` only, so
-    # tool-passthrough conversations always get the full set.
+    # Verified against 1.4.8: the agent frontmatter `tools:` YAML list IS
+    # honored as an allowlist ([view_file] leaves only view_file + manage_task;
+    # `tools: []` leaves manage_task only). `call_mcp_tool` can NOT be listed
+    # explicitly, and the scalar `"*"` is rejected — the full set (incl.
+    # call_mcp_tool) is granted by omitting `tools:`, so tool-passthrough
+    # conversations always get it.
     #
     # Modes for requests WITHOUT `tools` (plain chat: hermes' compression,
     # title generation, approval, vision, curator, …):
     #   "readonly" (default) — view_file only (still lets the model look at
     #                         attached images); no shell, no writes, no browser.
     #   "none"               — no builtin tools at all.
-    #   "all"                — legacy behavior, tools: "*".
+    #   "all"                — every builtin (no `tools:` field).
     plain_chat_tools: str = "readonly"
     # Builtins exposed on top of call_mcp_tool for tool-passthrough turns. Only
     # "all" is possible today (see above); kept as a setting so a future agy
@@ -193,13 +230,25 @@ class Settings(BaseSettings):
     # plain_chat_tools != "none".
     image_input: bool = True
 
-    # ── Conversation continuity ─────────────────────────────────────────────—
-    # agy stores conversation history server-side; `--conversation <id>` resumes
-    # it. We cache (history-prefix hash → agy conversation id) so a follow-up
-    # request sends only the newest user message instead of re-folding the whole
-    # transcript (cheaper: the prefix is already in agy's prompt cache).
-    conversation_cache_max: int = 256
-    conversation_cache_ttl_s: int = 3600
+    # ── Conversation continuity (cross-turn reuse) ─────────────────────────—
+    # A process survives its turn: after a clean final answer it is parked IDLE
+    # under (spawn signature + normalized history incl. the answer exactly as
+    # returned). A request whose messages[:-1] match adopts it and only the
+    # newest user message is sent (see app/conversation.py). False = one process
+    # per turn (every follow-up re-folds the whole transcript).
+    session_reuse: bool = True
+    # Dormant records: when a parked process is gone (LRU-evicted, idle TTL,
+    # crashed) its agy conversation id is remembered under the same history key
+    # so a follow-up respawns with `--conversation <id>` and still sends only
+    # the newest message. Bound (entries) and lifetime (seconds).
+    conversation_cache_max: int = Field(default=256, ge=0)
+    conversation_cache_ttl_s: int = Field(default=3600, gt=0)
+    # Recently delivered tool_call_ids: a second copy of a continuation whose
+    # results were already delivered is answered 409 (DuplicateContinuation)
+    # instead of being rebuilt — a rebuild would re-run the turn and its side
+    # effects. Bounded by count and age.
+    completed_call_memory_max: int = Field(default=1024, ge=0)
+    completed_call_memory_s: float = Field(default=600.0, gt=0)
 
     # ── Output formatting ──────────────────────────────────────────────────—
     # Rewrite Markdown pipe tables to fenced monospace ASCII so they render in
@@ -212,11 +261,13 @@ class Settings(BaseSettings):
     # Empty => only `default_workdir` is allowed.
     allowed_workdir_roots: list[str] = []
 
-    # ── MCP config registration ─────────────────────────────────────────────
-    # Tool-turn conversations register per-conversation server entries
-    # ("hermes", "hermes2", …) in the shared Antigravity MCP config — the ONLY
-    # file agy honors. Override the path for tests; disable management entirely
-    # to run the autonomous path without ever touching the user's config.
+    # ── Shared MCP config (legacy migration only) ──────────────────────────
+    # Tool turns declare their MCP server in the agent file (strict, per spawn)
+    # and never write the shared ~/.gemini/config/mcp_config.json. Older builds
+    # did ("hermes", "hermes2", … slots); at startup the server removes those
+    # leftovers once — only entries provably ours, after a one-time backup
+    # (see app/mcp_config.py). Override the path for tests; set
+    # manage_mcp_config=false to never touch the file at all.
     mcp_config_path: Optional[Path] = None
     manage_mcp_config: bool = True
 
@@ -235,10 +286,17 @@ class Settings(BaseSettings):
     rebuild_on_expiry: bool = True
 
     # ── Warm pool ───────────────────────────────────────────────────────────
-    # Pre-spawned idle agy procs for autonomous turns (see app/warmpool.py).
-    # 0 = off. Each idle proc is ~175 MB RSS and one conversation DB on disk;
-    # 1–2 is the useful range for a single user.
-    warm_pool_size: int = Field(default=0, ge=0, le=8)
+    # Pre-booted idle agy procs that the FIRST turn of a new conversation —
+    # plain or tool turn — adopts instead of paying the 1–3 s CLI boot (see
+    # app/warmpool.py). Each idle proc costs ≈200 MB RSS plus one empty
+    # conversation DB on disk; 1–2 is the useful range for a single user.
+    # 0 = off. Pooled procs are not counted against max_sessions.
+    warm_pool_size: int = Field(default=2, ge=0, le=8)
+    # How many distinct spawn signatures (model + agent/system prompt +
+    # toolset) the pool keeps warm at once — the hottest ones over the recent
+    # misses/hits. warm_pool_size is the TOTAL cap, split across them (2/2 =
+    # one warm proc each for e.g. hermes' main loop + its side-call prompt).
+    warm_pool_signatures: int = Field(default=2, ge=1, le=8)
     warm_pool_max_idle_s: float = Field(default=600.0, gt=0)
 
     # ── Logging ────────────────────────────────────────────────────────────—
@@ -335,7 +393,10 @@ def resolve_model(
       display name.
     * A known slug/alias resolves through its family; ``effort`` (or a
       ``-low``/``-medium``/``-high`` suffix on the slug) picks the variant when
-      the family has effort variants.
+      the family has effort variants. A display family name ("Gemini 4 Argon")
+      is slugified into its family slug. Short aliases whose fixed family the
+      catalog no longer lists fall back to keyword matching ("argon",
+      "sonnet", "claude", … → the first such family agy lists).
     * Empty/None → ``default_model``.
     * Anything else → :class:`UnknownModel` when ``settings.strict_model``,
       otherwise ``default_model``.
@@ -365,6 +426,14 @@ def resolve_model(
 
     family = _ALIASES.get(slug, slug)
     variants = fams.get(family)
+    if not variants:
+        # Alias whose fixed family is gone from this catalog: follow the
+        # current family of that kind (see _ALIAS_KEYWORDS).
+        for keyword in _ALIAS_KEYWORDS.get(slug, ()):
+            match = next((f for f in fams if keyword in f), None)
+            if match is not None:
+                variants = fams[match]
+                break
     if variants:
         if "" in variants:  # single-variant family; effort has nothing to pick
             return variants[""]
