@@ -37,6 +37,20 @@ def model_ids(request: Request) -> list[str]:
     return list(dict.fromkeys([*slugs, *multi, *displays]))
 
 
+def advertised_model_ids(request: Request) -> list[str]:
+    """What ``/v1/models`` lists: one id per model (``AGI_ADVERTISE_MODELS=
+    families``, default) or the legacy superset (``all``). Multi-variant
+    models appear as their family slug; single-variant ones as agy's slug."""
+    settings = request.app.state.settings
+    if settings.advertise_models == "all":
+        return model_ids(request)
+    catalog = getattr(request.app.state, "model_catalog", None)
+    families = catalog.families() if catalog is not None and catalog.loaded else _FAMILY_VARIANTS
+    # Family keys are agy's slugs minus the effort suffix; for a
+    # single-variant model the key IS its slug ("" variant).
+    return list(dict.fromkeys(families))
+
+
 def known_model(model_id: str, request: Request) -> bool:
     """Use completion alias resolution, but always reject unknown probe IDs."""
     if not model_id or not model_id.strip():
@@ -57,7 +71,7 @@ def known_model(model_id: str, request: Request) -> bool:
 
 @router.get("/v1/models", response_model=ModelList)
 async def list_models(request: Request) -> ModelList:
-    return ModelList(data=[ModelCard(id=mid) for mid in model_ids(request)])
+    return ModelList(data=[ModelCard(id=mid) for mid in advertised_model_ids(request)])
 
 
 @router.get("/v1/models/{model_id}", response_model=ModelCard)

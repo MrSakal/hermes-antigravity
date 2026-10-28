@@ -16,7 +16,7 @@ from fastapi import APIRouter, Request, Response, status
 from pydantic import BaseModel
 
 from app.openai_models import ModelList
-from app.routes.models import list_models, model_ids, known_model
+from app.routes.models import advertised_model_ids, list_models, known_model
 
 router = APIRouter()
 
@@ -33,7 +33,7 @@ def _app_version() -> str:
 
 async def _model_ids(request: Request) -> list[str]:
     """The advertised model ids, sourced from the OpenAI ``/v1/models`` handler."""
-    return model_ids(request)
+    return advertised_model_ids(request)
 
 
 # Static "details" block reused by /api/tags and /api/show. Values are nominal —

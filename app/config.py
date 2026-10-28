@@ -123,6 +123,12 @@ class Settings(BaseSettings):
     agy_bin: str = "agy"
     default_model: str = "Gemini 3.8 Flash (Medium)"
     default_effort: Optional[str] = None
+    # What GET /v1/models lists. "families" (default): one id per model
+    # (`gemini-3.8-flash`, `claude-opus-5-5`, …) so pickers show the model once
+    # and the effort travels separately as `reasoning_effort`. "all": legacy
+    # superset (variant slugs + families + display names). Every id stays a
+    # valid request input either way.
+    advertise_models: Literal["families", "all"] = "families"
     # Unknown `model` ids: True → 400 model_not_found (OpenAI semantics, the
     # client sees its mistake); False → silently use default_model (legacy).
     strict_model: bool = True
@@ -391,6 +397,29 @@ def check_prompt_size(prompt: str, settings: Settings) -> int:
     return n
 
 
+# OpenAI-compatible reasoning_effort vocabulary in ascending order. Clients
+# (hermes' custom provider, the OpenAI SDK) send any of these; agy only has
+# low/medium/high variants, so a request is clamped onto the nearest variant
+# the family actually has (none/minimal → lowest, xhigh/max → highest).
+EFFORT_LADDER: tuple[str, ...] = ("none", "minimal", "low", "medium", "high", "xhigh", "max")
+
+
+def clamp_effort(effort: Optional[str], variants: dict[str, str]) -> Optional[str]:
+    """Nearest available variant key for an OpenAI effort level, or None
+    when ``effort`` is empty/unrecognised (caller applies its default).
+    Ties prefer the lower variant (cheaper, and what "between" usually means)."""
+    eff = (effort or "").strip().lower()
+    if eff in variants:
+        return eff
+    if eff not in EFFORT_LADDER:
+        return None
+    ranked = [v for v in EFFORT_LADDER if v in variants]
+    if not ranked:
+        return None
+    want = EFFORT_LADDER.index(eff)
+    return min(ranked, key=lambda v: (abs(EFFORT_LADDER.index(v) - want), EFFORT_LADDER.index(v)))
+
+
 def resolve_model(
     requested: Optional[str],
     settings: Settings,
@@ -450,6 +479,7 @@ def resolve_model(
     if variants:
         if "" in variants:  # single-variant family; effort has nothing to pick
             return variants[""]
+        eff = clamp_effort(eff, variants) or eff
         if eff in variants:
             return variants[eff]
         # Effort absent/unknown: prefer medium, then high, then low.

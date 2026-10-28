@@ -84,7 +84,9 @@ class ChatCompletionRequest(BaseModel):
     # Non-standard CCI extensions:
     workdir: Optional[str] = None
     effort: Optional[str] = None
-    reasoning_effort: Optional[Literal["low", "medium", "high"]] = None
+    # Full OpenAI vocabulary; clamped onto the family's agy variants
+    # (app.config.clamp_effort) — hermes sends "none" when reasoning is off.
+    reasoning_effort: Optional[Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"]] = None
 
 
 # ── Response (non-streaming) ──────────────────────────────────────────────—

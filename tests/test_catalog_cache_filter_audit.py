@@ -84,15 +84,20 @@ def test_discovery_and_aliases_share_canonical_variants(live):
         app.state.model_catalog = cat
     client = TestClient(app)
     ids = [x['id'] for x in client.get('/v1/models').json()['data']]
-    # Superset: variant slugs first (agy's order), then multi-variant family
-    # slugs, then display names — every advertised id is a valid input.
-    slugs = [e.slug for e in entries]
-    families = [f for f, v in _FAMILY_VARIANTS.items() if '' not in v]
-    assert len(ids) == len(set(ids))
-    assert ids == slugs + families + [e.display for e in entries]
+    # Default: one id per model (family slug); effort travels separately.
+    assert ids == list(_FAMILY_VARIANTS)
     assert [m['name'] for m in client.get('/api/tags').json()['models']] == ids
     assert [m['id'] for m in client.get('/api/v1/models').json()['data']] == ids
-    aliases = ids + [e.display for e in entries] + list(_FAMILY_VARIANTS) + ['flash', 'sonnet', 'opus']
+    # Legacy superset on request: variant slugs, multi-variant families, display names.
+    app.state.settings = app.state.settings.model_copy(update={'advertise_models': 'all'})
+    full = [x['id'] for x in client.get('/v1/models').json()['data']]
+    slugs = [e.slug for e in entries]
+    families = [f for f, v in _FAMILY_VARIANTS.items() if '' not in v]
+    assert len(full) == len(set(full))
+    assert full == slugs + families + [e.display for e in entries]
+    app.state.settings = app.state.settings.model_copy(update={'advertise_models': 'families'})
+    # Every legacy id stays a valid input even though it is no longer listed.
+    aliases = full + list(_FAMILY_VARIANTS) + ['flash', 'sonnet', 'opus']
     for alias in aliases:
         assert client.get('/v1/models/' + alias).status_code == 200, alias
         assert client.post('/api/show', json={'model': alias}).status_code == 200, alias

@@ -117,6 +117,7 @@ automatically. The systemd example below uses `EnvironmentFile`.
 | `AGI_AGY_BIN` | `agy` | Path to the `agy` CLI. |
 | `AGI_DEFAULT_MODEL` | `Gemini 3.8 Flash (Medium)` | Model used when the request names none (display name or agy slug). Unknown requests only fall back when strict mode is disabled. |
 | `AGI_DEFAULT_EFFORT` | _(unset)_ | Effort used to pick a model variant (`low`/`medium`/`high`). |
+| `AGI_ADVERTISE_MODELS` | `families` | `/v1/models` content. `families`: one id per model (`gemini-3.8-flash`); the client picks the variant via `reasoning_effort` (`none`…`max`, clamped to the nearest agy variant: `none`/`minimal` → low, `xhigh`/`max` → high). `all`: legacy list of variant slugs + families + display names. All ids are accepted as input either way. |
 | `AGI_MAX_PROMPT_BYTES` | `4000000` | UTF-8 prompt sanity cap; oversized requests return 400 `context_length_exceeded`. Replaces `AGI_MAX_PROMPT_CHARS`; no disk prompt handoff. |
 | `AGI_DISABLE_SLASH_COMMANDS` | `true` | Prevent user content from invoking CLI slash commands. |
 | `AGI_STRICT_MODEL` | `true` | Reject unknown models with 400 `model_not_found`; false retains legacy default fallback. |

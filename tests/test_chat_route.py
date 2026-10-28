@@ -407,11 +407,11 @@ async def test_models_endpoint_static_fallback(client):
     http, _ = client
     r = await http.get("/v1/models")
     ids = [m["id"] for m in r.json()["data"]]
-    # Superset: variant slugs, then family slugs, then display names.
-    assert ids.index("gemini-3.8-flash-high") < ids.index("gemini-3.8-flash")
-    assert ids.index("gemini-3.8-flash") < ids.index("Gemini 3.8 Flash (Medium)")
-    assert "gemini-3.8-flash-medium" in ids
+    # One id per model: family slugs only, no effort variants or display names.
+    assert "gemini-3.8-flash" in ids
     assert "claude-opus-5-5" in ids  # agy's own slug spelling
+    assert "gemini-3.8-flash-medium" not in ids
+    assert "Gemini 3.8 Flash (Medium)" not in ids
 
 
 async def test_models_endpoint_live_catalog(client):
@@ -419,13 +419,14 @@ async def test_models_endpoint_live_catalog(client):
     async with application.router.lifespan_context(application):
         r = await http.get("/v1/models")
         ids = [m["id"] for m in r.json()["data"]]
-        assert "gemini-9.9-flash" in ids  # family slug advertised too
-        assert "gemini-9.9-flash-medium" in ids
-        assert "Gemini 9.9 Flash (Low)" in ids  # and agy's display names
-        assert "gemini-9.9-flash-low" in ids
+        assert "gemini-9.9-flash" in ids  # family slug from the live catalog
+        assert "gemini-9.9-flash-medium" not in ids  # variants are not listed…
+        assert "Gemini 9.9 Flash (Low)" not in ids
         assert "gemini-3.8-flash" not in ids  # static table not mixed in
         r = await http.get("/v1/models/gemini-9.9-flash")
         assert r.status_code == 200
+        r = await http.get("/v1/models/gemini-9.9-flash-low")
+        assert r.status_code == 200  # …but still resolve as inputs
         r = await http.get("/v1/models/nope")
         assert r.status_code == 404
 
