@@ -184,6 +184,9 @@ def main():
         with urllib.request.urlopen(base + "/metrics", timeout=5) as response:
             return json.load(response)
 
+    def busy(m):  # turns in flight: RUNNING or parked mid tool call
+        return m["processes_running"] + m["sessions_suspended"]
+
     for stream, tools in ((False, False), (True, False), (False, True), (True, True)):
         # With a warm pool the request may ADOPT a pre-existing proc and the PID
         # that newly appears is the background refill; ownership by PID delta is
@@ -200,9 +203,9 @@ def main():
         with socket.create_connection(("127.0.0.1", args.port), timeout=5) as sock:
             sock.sendall(wire)
             deadline = time.monotonic() + 5
-            while time.monotonic() < deadline and metrics()["sessions_active"] == 0:
+            while time.monotonic() < deadline and busy(metrics()) == 0:
                 time.sleep(0.05)
-            active = metrics()["sessions_active"]
+            active = busy(metrics())
             seen = agy_pids()
         start = time.monotonic()
         deadline = start + 10
@@ -210,12 +213,12 @@ def main():
         # keeps warm ones: after the disconnect the OS-level agy count must
         # equal exactly what the server accounts for (conversation-owned live
         # processes + pool), with no turn left active.
-        while time.monotonic() < deadline and (metrics()["sessions_active"]
+        while time.monotonic() < deadline and (busy(metrics())
                                                or len(agy_pids()) != metrics()["processes_total"]):
             time.sleep(0.1)
         m = metrics()
         check(f"disconnect stream={stream} tools={tools}",
-              active >= 1 and m["sessions_active"] == 0 and m["processes_running"] == 0
+              active >= 1 and busy(m) == 0
               and len(agy_pids()) == m["processes_total"],
               f"procs during={sorted(seen - before) or sorted(seen)}, after={sorted(agy_pids())}, "
               f"server-accounted {m['processes_total']} (pool idle {idle_before}->{m['warm_pool_idle']}), "
@@ -228,7 +231,7 @@ def main():
     # mcp_transport_sessions is NOT in here: a tool conversation parked IDLE for
     # reuse keeps agy's MCP session open (it closes with the conversation), so
     # it is bounded by the live process count instead (checked below).
-    idle_keys = ("sessions_active", "sessions_waiting", "sessions_suspended",
+    idle_keys = ("sessions_suspended",
                  "processes_running", "http_active", "attachment_workspaces_pinned")
     # PID exit precedes completion of ASGI teardown. Observe the actual release
     # condition with the same bounded grace as disconnect/process cleanup above.

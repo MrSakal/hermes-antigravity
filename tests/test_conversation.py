@@ -58,7 +58,7 @@ async def collect_turn(mgr, conv):
     return chunks
 
 
-async def test_full_tool_cycle(mgr, fake_agy, tmp_path):
+async def test_full_tool_cycle(mgr, fake_agy, tmp_path, agent_writes):
     fake_agy("hang")
     req = make_request()
     conv = await mgr.create(req, model="Gemini 3.7 Flash (Medium)",
@@ -66,11 +66,13 @@ async def test_full_tool_cycle(mgr, fake_agy, tmp_path):
 
     # The conversation's MCP server lives in the agent file it booted with —
     # strict (no inherited user servers), named by toolset, routed by URL.
-    agent_md = mgr.agents.agent_file.read_text(encoding="utf-8")
+    agent_md = agent_writes[-1]
     assert conv.slot == server_name_for(req.tools)
     assert f"  - name: {conv.slot}\n" in agent_md and "inheritMcp: false" in agent_md
     assert f"/mcp/{conv.conv_id}\"" in agent_md
-    assert conv.session.agent == "hermes"
+    assert conv.session.agent.startswith("hermes-")
+    assert f"name: {conv.session.agent}\n" in agent_md
+    assert mgr.agents.transient_files() == []  # deleted after the first line
     assert not (tmp_path / "mcp_config.json").exists()  # shared config never written
 
     # Simulate agy calling our MCP bridge (what call_tool does) — like the real
@@ -153,8 +155,8 @@ async def test_clean_completion_closes_without_reuse(mgr, fake_agy, tmp_path):
     chunks = await collect_turn(mgr, conv)
     assert isinstance(chunks[-1], DoneChunk)
     assert conv.state == "closed"
-    # Still resumable by agy conversation id (the old convcache behaviour).
-    assert [d.agy_id for d in mgr._dormant.values()] == ["conv-fake-1"]
+    # Nothing is kept for a resume: the agy conversation is unreferenced.
+    assert not mgr._idle and mgr.referenced_agy_ids() == set()
 
 
 async def test_upstream_error_surfaces(mgr, fake_agy):

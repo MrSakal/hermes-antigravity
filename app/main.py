@@ -26,9 +26,10 @@ from app.config import KNOWN_MODELS, get_settings
 from app.conversation import ConversationManager
 from app.errors import OpenAIError
 from app.mcp_bridge import McpBridge
-from app.mcp_config import cleanup_legacy_mcp_entries
+from app.housekeeping import Housekeeper
+from app.mcp_config import cleanup_legacy_mcp_entries, legacy_entries_remaining
 from app.model_catalog import ModelCatalog
-from app.resources import Admission, AttachmentStore, Metrics
+from app.resources import AttachmentStore, Metrics
 from app.request_guard import RequestGuard
 from app.routes import chat, compat, health, models
 from app.warmpool import WarmPool
@@ -48,6 +49,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     mcp: McpBridge = app.state.mcp
     catalog: ModelCatalog = app.state.model_catalog
+    housekeeper: Housekeeper = app.state.housekeeper
+    # Ledger + state lock first: crash recovery of a previous run (its agy
+    # processes killed, its conversations deleted) and every spawn below
+    # (catalog refresh included) logs into our state dir, not acli/log.
+    await housekeeper.start()
     # Load the live model list before serving; failures keep the static table.
     if await catalog.refresh():
         logger.info("model catalog loaded from `agy models` (%d models)", len(catalog.entries))
@@ -59,25 +65,36 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         catalog_task = asyncio.create_task(catalog.refresh_loop(), name="agi-model-catalog")
     pool: WarmPool = app.state.warm_pool
     pool_task = asyncio.create_task(_pool_gc_loop(pool, settings.gc_interval_s), name="agi-warmpool-gc") if pool.enabled else None
-    # Migration from older builds: per-prompt agent files and hermes/hermesN
-    # slots they left in the shared MCP config (backed up once; never ours to
+    # Housekeeping + migration from older builds: leftover transient agent
+    # files (a crash between write and delete), the previous build's single
+    # hermes.md + .hermes.md.lock, per-prompt agent files, and hermes/hermesN
+    # slots left in the shared MCP config (backed up once; never ours to
     # write again).
-    app.state.agent_plugin.cleanup_legacy()
+    app.state.agent_plugin.startup_cleanup()
     if settings.manage_mcp_config:
         await asyncio.to_thread(cleanup_legacy_mcp_entries, settings.mcp_config_path)
+        if await asyncio.to_thread(legacy_entries_remaining, settings.mcp_config_path) is False:
+            # Migration complete: the next sweep removes its one-time backup.
+            housekeeper.record_migration_done()
+    hk_task = asyncio.create_task(_housekeeping_loop(housekeeper, settings.housekeeping_interval_s),
+                                  name="agi-housekeeping") if housekeeper.active else None
     async with mcp.lifespan():
         manager: ConversationManager = app.state.conv_manager
         gc_task = asyncio.create_task(manager.gc_loop(), name="agi-gc")
         try:
             yield
         finally:
-            for task in (gc_task, catalog_task, attachment_task, pool_task):
+            for task in (gc_task, catalog_task, attachment_task, pool_task, hk_task):
                 if task is not None:
                     task.cancel()
                     with contextlib.suppress(asyncio.CancelledError):
                         await task
             await pool.stop()
             await manager.close_all()
+            await app.state.agent_plugin.aclose()
+            # Every process is gone now: delete their agy state, release the
+            # state lock (what a held file delayed waits for the next start).
+            await housekeeper.stop()
             logger.info("antigravity-interface shutting down")
 
 
@@ -85,6 +102,17 @@ async def _pool_gc_loop(pool: WarmPool, interval_s: int) -> None:
     while True:
         await asyncio.sleep(max(1, interval_s))
         await pool.gc()
+
+
+async def _housekeeping_loop(housekeeper: Housekeeper, interval_s: int) -> None:
+    while True:
+        await asyncio.sleep(max(1, interval_s))
+        try:
+            await housekeeper.sweep()
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # pragma: no cover - defensive
+            logger.exception("housekeeping sweep failed")
 
 
 def create_app() -> FastAPI:
@@ -106,25 +134,30 @@ def create_app() -> FastAPI:
     app = FastAPI(title="antigravity-interface", lifespan=lifespan)
     app.state.settings = settings
     app.state.metrics = Metrics()
-    app.state.admission = Admission(settings.max_sessions, settings.max_queued_requests,
-                                    settings.admission_timeout_s, app.state.metrics)
     app.state.attachments = AttachmentStore(settings)
     agent_plugin = AgentPluginManager(
         settings.agent_plugin_path, start_timeout_s=settings.agent_start_timeout_s,
         agent_name=settings.agent_name,
     )
     app.state.agent_plugin = agent_plugin
-    manager = ConversationManager(mcp, settings, agents=agent_plugin)
+    housekeeper = Housekeeper(settings, plugin_path=agent_plugin.path,
+                              agent_name=settings.agent_name)
+    app.state.housekeeper = housekeeper
+    housekeeper.on_workdirs = app.state.attachments.add_workdirs
+    app.state.attachments.on_workdir = housekeeper.note_workdir
+    manager = ConversationManager(mcp, settings, agents=agent_plugin, housekeeper=housekeeper)
     # Pooled entries pre-mint their conv_id and bake /mcp/<conv_id> into the
     # agent file, so the pool shares the manager's MCP bridge and URL scheme.
     manager.pool = WarmPool(settings, settings.warm_pool_size,
                             max_idle_s=settings.warm_pool_max_idle_s,
                             agents=agent_plugin, mcp=mcp, mcp_url=manager._mcp_url)
+    manager.pool.housekeeper = housekeeper
     app.state.warm_pool = manager.pool
     app.state.mcp = mcp
     app.state.model_catalog = ModelCatalog(
         settings.agy_bin, refresh_interval_s=settings.model_catalog_refresh_s
     )
+    app.state.model_catalog.housekeeper = housekeeper
     app.state.conv_manager = manager
 
     @app.exception_handler(OpenAIError)

@@ -17,7 +17,7 @@ from app.agy_session import AgySession, STREAM_CLOSED
 from app.config import Settings
 from app.errors import OpenAIError
 from app.conversation import (Conversation, ConversationManager, DoneChunk, ErrorChunk,
-                              TextChunk, _Dormant, history_key)
+                              TextChunk, history_key)
 from app.events import TextDelta, TurnDone
 from app.mcp_bridge import ConversationBridge, McpBridge
 from app.openai_models import ChatCompletionRequest, ChatMessage, ToolDef
@@ -44,18 +44,20 @@ def test_changed_image_changes_cache_key():
 
 
 async def test_old_prefix_does_not_resume_already_extended_conversation(tmp_path):
-    """A dormant record is consumed by its first claim: a second branch off the
-    same prefix must miss instead of resuming a conversation that already
-    contains the first branch."""
+    """An IDLE process is consumed by its first claim: a second branch off the
+    same prefix must miss (and start fresh) instead of adopting a process that
+    already contains the first branch."""
     mgr = manager(tmp_path)
-    gone = asyncio.Event()
-    gone.set()
     prefix = [ChatMessage(role='user', content='root question'),
               ChatMessage(role='assistant', content='root answer')]
     key = history_key('sig', prefix)
-    mgr._dormant[key] = _Dormant('fixture-conversation', gone)
-    assert (await mgr._claim_idle(key))[1] is not None   # branch A resumes it
-    assert (await mgr._claim_idle(key))[1] is None, 'Old prefix still points to a conversation already containing branch A'
+    conv = Conversation(conv_id='c1', slot=None, session=SimpleNamespace(running=True),
+                        bridge=ConversationBridge('c1', []), model='m', state='idle',
+                        reuse_key=key)
+    mgr._conversations['c1'] = conv
+    mgr._idle[key] = 'c1'
+    assert await mgr._claim_idle(key) is conv   # branch A adopts it
+    assert await mgr._claim_idle(key) is None, 'Old prefix still points to a process already containing branch A'
 
 
 class StubSession:
@@ -161,8 +163,11 @@ async def test_tool_choice_none_does_not_spawn_unrestricted_mcp_turn(tmp_path, m
     monkeypatch.setattr(main, 'get_settings', lambda:settings)
     monkeypatch.setattr(chat, 'get_settings', lambda:settings)
     spawned = []
+    booted = []
     async def fake_start(sess):
         spawned.append(sess)
+        # What agy reads at boot (the transient file is gone after the first line).
+        booted.append((settings.agent_plugin_path/'agents'/f'{sess.agent}.md').read_text())
         sess._queue.put_nowait(TextDelta('fixture answer'))
         sess._queue.put_nowait(TurnDone(response_text='fixture answer'))
     monkeypatch.setattr(AgySession, 'start', fake_start)
@@ -175,8 +180,8 @@ async def test_tool_choice_none_does_not_spawn_unrestricted_mcp_turn(tmp_path, m
         })
     assert response.status_code == 200
     assert spawned
-    agent_file = settings.agent_plugin_path/'agents'/f'{spawned[0].agent}.md'
-    assert 'tools: "*"' not in agent_file.read_text(), agent_file.read_text()
+    assert 'tools: "*"' not in booted[0], booted[0]
+    assert not list((settings.agent_plugin_path/'agents').glob('*.md'))
 
 
 async def test_close_reaps_child_processes(tmp_path, monkeypatch):

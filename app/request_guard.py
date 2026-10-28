@@ -19,16 +19,13 @@ class RequestGuard:
         if scope['type'] != 'http':
             return await self.app(scope, receive, send)
         path = scope.get('path', '')
-        # Bound all API bodies; only completions occupy the HTTP admission budget.
+        # Bound all API bodies (input validation). No concurrency cap: a
+        # provider serves every call; completions are only counted.
         is_chat = path == '/v1/chat/completions'
         guarded = path.startswith(('/v1/', '/api/', '/mcp'))
         state = scope.setdefault('state', {})
         started = time.monotonic()
         if is_chat:
-            if self.metrics.http_active >= self.settings.max_sessions + self.settings.max_queued_requests:
-                self.metrics.counters['http_overloaded'] += 1
-                return await OpenAIError('HTTP request capacity reached', status_code=503,
-                                         code='server_overloaded').json_response()(scope, receive, send)
             self.metrics.http_active += 1
             self.metrics.counters['requests'] += 1
             state['request_started'] = started

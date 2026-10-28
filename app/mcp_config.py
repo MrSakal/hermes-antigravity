@@ -61,6 +61,27 @@ def _is_ours(name: str, spec: Any) -> bool:
     )
 
 
+def legacy_entries_remaining(path: Optional[Path] = None) -> Optional[bool]:
+    """False once the shared config holds none of our legacy entries (or does
+    not exist) — the migration is complete and its backup may go; True while
+    some remain; None when the file cannot be read or parsed (unknown)."""
+    path = Path(path).expanduser() if path else default_config_path()
+    try:
+        raw = Path(os.path.realpath(path)).read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return None
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return None
+    servers = data.get("mcpServers") if isinstance(data, dict) else None
+    if not isinstance(servers, dict):
+        return False
+    return any(_is_ours(name, spec) for name, spec in servers.items())
+
+
 def cleanup_legacy_mcp_entries(path: Optional[Path] = None) -> int:
     """Remove our legacy slot entries from the shared config. Returns the count
     removed; never raises."""
@@ -96,7 +117,7 @@ def cleanup_legacy_mcp_entries(path: Optional[Path] = None) -> int:
     for name in stale:
         servers.pop(name)
     try:
-        fd, tmp = tempfile.mkstemp(dir=str(real.parent), suffix=".tmp")
+        fd, tmp = tempfile.mkstemp(dir=str(real.parent), prefix=".agi-", suffix=".tmp")
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)

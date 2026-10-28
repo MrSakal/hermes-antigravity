@@ -143,10 +143,8 @@ class Settings(BaseSettings):
     max_images: int = Field(default=16, ge=0)
     max_tools: int = Field(default=128, ge=0)
     max_tool_schema_bytes: int = Field(default=1_000_000, gt=0)
-    max_sessions: int = Field(default=8, gt=0)
-    max_suspended_sessions: int = Field(default=4, gt=0)
-    max_queued_requests: int = Field(default=16, ge=0)
-    admission_timeout_s: float = Field(default=5.0, gt=0)
+    # No concurrency caps: a provider gives every call its own agy process
+    # immediately (~200 MB RSS each). Idle ones leave via idle_session_ttl_s.
     event_queue_size: int = Field(default=256, gt=0)
     max_pending_tool_calls: int = Field(default=32, gt=0)
     stdin_timeout_s: float = Field(default=30.0, gt=0)
@@ -157,29 +155,28 @@ class Settings(BaseSettings):
     disable_slash_commands: bool = True
 
     # ── System prompt via managed agent ─────────────────────────────────────
-    # Deliver the request's system message as a REAL system prompt: write it
-    # into the ONE managed agent file (plugins/hermes-bridge/agents/hermes.md)
-    # and spawn agy with --agent hermes. Verified against agy 1.4.8: the body
-    # overrides the CLI's built-in persona and is read at process boot, before
-    # the first stdout line — every spawn holds a lock from the write until that
-    # line (see app/agent_config.py), so concurrent requests never see each
-    # other's prompt. The file is rewritten only when its bytes change. When
-    # disabled, the system message uses a preamble. Restricted plain-chat modes
-    # and tool turns still need the agent (tool allowlist / MCP server) and
-    # fail closed (503) if the plugin cannot be written.
+    # Deliver the request's system message as a REAL system prompt: each spawn
+    # writes its own transient agent file (plugins/hermes-bridge/agents/
+    # <agent_name>-<12 hex>.md) and runs agy with --agent <that name>. Verified
+    # against agy 1.4.8: the body overrides the CLI's built-in persona and is
+    # read at process boot, before the first stdout line; the file is deleted
+    # right after that line (see app/agent_config.py). No lock: concurrent
+    # spawns never share a file. When disabled, the system message uses a
+    # preamble. Restricted plain-chat modes and tool turns still need the agent
+    # (tool allowlist / MCP server) and fail closed (503) if the plugin cannot
+    # be written.
     system_prompt_via_agent: bool = True
     # Managed plugin directory (never touches other plugins). Override for tests.
     agent_plugin_path: Optional[Path] = None
-    # Name of the managed agent (``agents/<name>.md``, ``--agent <name>``). A
-    # second server on the same HOME must use its own plugin path AND name —
-    # two plugins defining one agent name make ``--agent`` ambiguous.
+    # Base name of the managed agent (per-spawn files ``agents/<name>-<hex>.md``).
+    # A second server on the same HOME should use its own plugin path AND name,
+    # so neither sweeps the other's files.
     agent_name: str = Field(default="hermes", pattern=r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
-    # Max wait for a spawned agy's first stdout line (proof it read the agent
-    # file) while holding the agent-file lock. On timeout the process is killed
-    # and the request fails 504 — a slow agy must never read the next spawn's
-    # file. Boot is ~1-3 s; this only bounds a hung CLI, which blocks every
-    # other spawn for this long — so it is kept short. A request whose spawn
-    # queue would outlast its own deadline fails fast with 503.
+    # Max wait for a spawned agy's first stdout line (proof it read its agent
+    # file). On timeout the process is killed, its agent file deleted and the
+    # request fails 504. Boot is ~1-3 s; this only bounds a hung CLI and no
+    # other spawn ever waits on it. Transient agent files older than 2x this
+    # value are swept by the GC loop.
     agent_start_timeout_s: float = Field(default=30.0, gt=0)
     # Let agy also see the user's own MCP servers from the shared
     # ~/.gemini/config/mcp_config.json (agent frontmatter `inheritMcp`). Off by
@@ -235,14 +232,10 @@ class Settings(BaseSettings):
     # under (spawn signature + normalized history incl. the answer exactly as
     # returned). A request whose messages[:-1] match adopts it and only the
     # newest user message is sent (see app/conversation.py). False = one process
-    # per turn (every follow-up re-folds the whole transcript).
+    # per turn (every follow-up re-folds the whole transcript). Once a parked
+    # process is gone (idle TTL, crash) a follow-up starts fresh with the whole
+    # history folded; the exited process' agy state is deleted at once.
     session_reuse: bool = True
-    # Dormant records: when a parked process is gone (LRU-evicted, idle TTL,
-    # crashed) its agy conversation id is remembered under the same history key
-    # so a follow-up respawns with `--conversation <id>` and still sends only
-    # the newest message. Bound (entries) and lifetime (seconds).
-    conversation_cache_max: int = Field(default=256, ge=0)
-    conversation_cache_ttl_s: int = Field(default=3600, gt=0)
     # Recently delivered tool_call_ids: a second copy of a continuation whose
     # results were already delivered is answered 409 (DuplicateContinuation)
     # instead of being rebuilt — a rebuild would re-run the turn and its side
@@ -290,7 +283,7 @@ class Settings(BaseSettings):
     # plain or tool turn — adopts instead of paying the 1–3 s CLI boot (see
     # app/warmpool.py). Each idle proc costs ≈200 MB RSS plus one empty
     # conversation DB on disk; 1–2 is the useful range for a single user.
-    # 0 = off. Pooled procs are not counted against max_sessions.
+    # 0 = off.
     warm_pool_size: int = Field(default=2, ge=0, le=8)
     # How many distinct spawn signatures (model + agent/system prompt +
     # toolset) the pool keeps warm at once — the hottest ones over the recent
@@ -298,6 +291,26 @@ class Settings(BaseSettings):
     # one warm proc each for e.g. hermes' main loop + its side-call prompt).
     warm_pool_signatures: int = Field(default=2, ge=1, le=8)
     warm_pool_max_idle_s: float = Field(default=600.0, gt=0)
+
+    # ── Housekeeping (zero footprint, see app/housekeeping.py) ─────────────—
+    # Our own state dir: the ownership ledger (every agy conversation, process
+    # and workdir this server created), per-process agy logs, instance locks.
+    # Default: Linux $XDG_STATE_HOME/hermes-antigravity (~/.local/state/...),
+    # Windows %LOCALAPPDATA%\hermes-antigravity.
+    state_dir: Optional[Path] = None
+    # agy's own state dir (~/.gemini/antigravity-cli). Only ledger uuids are
+    # ever deleted from it; the user's own agy / IDE conversations never.
+    agy_state_root: Optional[Path] = None
+    # False = no ledger, no --log-file, no deletion (agy's default footprint).
+    housekeeping: bool = True
+    # Periodic sweep (crashed runs, leftovers a locked file delayed, our MCP
+    # schema caches, temp files, stale logs).
+    housekeeping_interval_s: int = Field(default=600, gt=0)
+    # Our acli/mcp/hermes-<8hex>/ tool-schema caches unused this long go.
+    mcp_cache_max_age_s: int = Field(default=7 * 86400, gt=0)
+    # Keep the per-process agy log of a FAILED process (boot failure, error
+    # result) in <state_dir>/logs for 7 days; others are always deleted.
+    keep_agy_logs: bool = False
 
     # ── Logging ────────────────────────────────────────────────────────────—
     log_level: str = "INFO"

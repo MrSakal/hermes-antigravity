@@ -4,8 +4,7 @@ Every request — with or without ``tools`` — goes through the
 :class:`~app.conversation.ConversationManager`: a continuation (trailing
 ``tool`` results) resumes its suspended agy process (or rebuilds it from the
 transcript); anything else reuses an IDLE process whose history matches,
-resumes a dormant agy conversation, adopts a warm-pool process, or spawns
-fresh. The manager's turn loop yields one chunk vocabulary (text / reasoning /
+adopts a warm-pool process, or spawns fresh. The manager's turn loop yields one chunk vocabulary (text / reasoning /
 tool calls / done / error); this module only renders it, as SSE or as one JSON
 completion, so streaming and non-streaming cannot drift apart.
 
@@ -175,31 +174,28 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
             if req.model is None:
                 model = existing.model
     await asyncio.to_thread(ensure_workdir, workdir)
-    if not continuation:
-        release = await request.app.state.admission.acquire(request)
-        request.state.resource_releases.append(release)
+    # No admission control: every new turn gets its own agy process now.
     attachment_release = request.app.state.attachments.pin_and_write(workdir, images)
     request.state.resource_releases.append(attachment_release)
 
     owns_releases = not continuation
 
-    async def admit_for_rebuild():
+    async def own_for_rebuild():
         nonlocal owns_releases
         owns_releases = True
-        request.state.resource_releases.append(await request.app.state.admission.acquire(request))
 
     try:
         budget = _remaining(request, settings)
-        # The spawn queue fails fast (503) when it would outlast the request.
-        deadline = asyncio.get_running_loop().time() + budget
+        # Spawns never queue (per-spawn agent files); only the request
+        # deadline bounds them (504), never a capacity cap.
         if continuation:
             conv = await asyncio.wait_for(
                 mgr.resume_or_rebuild(req, model=model, workdir=workdir,
-                                      before_create=admit_for_rebuild, deadline=deadline),
+                                      before_create=own_for_rebuild),
                 timeout=budget)
         else:
             conv = await asyncio.wait_for(
-                mgr.start_turn(req, model=model, workdir=workdir, deadline=deadline),
+                mgr.start_turn(req, model=model, workdir=workdir),
                 timeout=budget)
     except ExpiredContinuation as e:
         raise OpenAIError(str(e), status_code=409, type="invalid_request_error",
@@ -208,7 +204,7 @@ async def chat_completions(req: ChatCompletionRequest, request: Request):
         raise OpenAIError('upstream startup timeout', status_code=504, type='timeout_error') from exc
 
     if owns_releases:
-        # The session permit (+ attachment pin) belongs to the turn now: held
+        # The attachment pin belongs to the turn now: held
         # while it is RUNNING or SUSPENDED, released when it parks or closes.
         releases = request.state.resource_releases
         request.state.resource_releases = []

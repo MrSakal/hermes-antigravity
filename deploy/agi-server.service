@@ -9,9 +9,11 @@ WorkingDirectory=/home/hermes/hermes-antigravity
 EnvironmentFile=/home/hermes/hermes-antigravity/.env
 Environment=HOME=/home/hermes
 Environment=PATH=/home/hermes/.local/bin:/usr/local/bin:/usr/bin:/bin
-# Recreate the writable workspace outside the service filesystem sandbox if removed.
-ExecStartPre=+/usr/bin/install -d -m 0700 /home/hermes/agi-workspace
+# Recreate the writable workspace + state dir outside the service filesystem sandbox if removed.
+ExecStartPre=+/usr/bin/install -d -m 0700 /home/hermes/agi-workspace /home/hermes/.local/state/hermes-antigravity
 ExecStart=/home/hermes/hermes-antigravity/.venv/bin/python -m uvicorn app.main:app --host 127.0.0.1 --port 8788
+# Graceful stop (SIGTERM): shutdown deletes the run's agy conversations.
+TimeoutStopSec=60
 Restart=on-failure
 RestartSec=3
 UMask=0077
@@ -19,7 +21,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=read-only
-ReadWritePaths=/home/hermes/agi-workspace /home/hermes/.gemini
+ReadWritePaths=/home/hermes/agi-workspace /home/hermes/.gemini /home/hermes/.local/state/hermes-antigravity
 
 [Install]
 WantedBy=default.target

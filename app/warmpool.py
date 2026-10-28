@@ -16,8 +16,9 @@ is reusable only by a request with an equal :class:`Signature`. Each entry:
   carrying the target toolset under ``/mcp/<conv_id>``;
 * boots with that URL baked into its agent file (``mcpServers`` entry
   ``hermes-<toolset sha8>``) — every pooled boot goes through
-  :meth:`~app.agent_config.AgentPluginManager.spawn`, which holds the
-  agent-file lock until agy's first stdout line;
+  :meth:`~app.agent_config.AgentPluginManager.spawn`, which writes a
+  per-spawn agent file and deletes it at agy's first stdout line (no lock:
+  refills boot in parallel with request spawns);
 * on adoption the request's tools are late-bound into that bridge before the
   first stdin message. Safe because agy contacts MCP servers lazily, at the
   first message — verified live on 1.4.8 (zero requests during a 12 s idle
@@ -43,8 +44,8 @@ warm one (hysteresis), so mixed traffic — e.g. hermes' main
 loop interleaved with its side calls — keeps both warm instead of thrashing
 the pool on every switch.
 
-**Priority and failures.** Refills spawn with ``priority=False``: they take the
-agent-file lock only while no request-driven spawn is queued. A boot that
+**Failures.** Refills never delay a request spawn (each boot has its own
+agent file; nothing is shared or locked). A boot that
 fails (agy exits before its first line: logged out, bad model, rejected agent)
 or a pooled proc that dies while idle puts the pool into exponential backoff
 (1 s doubling to 60 s, reset on the next good boot) — it never respawns in a
@@ -52,10 +53,10 @@ tight loop.
 
 ``--print-timeout`` is disabled for persistent procs, so an idle pooled proc
 does not expire on its own; ``max_idle_s`` recycles it anyway (stale auth /
-model list). Each idle proc costs ≈175–200 MB RSS and leaves one (empty)
-conversation DB in ``~/.gemini/antigravity-cli/conversations``. Set
-``AGI_WARM_POOL_SIZE=0`` to disable. Pooled procs are NOT counted against
-``max_sessions`` until adopted.
+model list). Each idle proc costs ≈175–200 MB RSS. Its (empty) agy
+conversation is recorded in the housekeeping ledger at boot and deleted as
+soon as a never-adopted proc is discarded (see app.housekeeping). Set
+``AGI_WARM_POOL_SIZE=0`` to disable.
 """
 
 from __future__ import annotations
@@ -138,6 +139,9 @@ class WarmPool:
         self.agents = agents
         self.mcp = mcp
         self.mcp_url = mcp_url
+        # app.housekeeping.Housekeeper (or None): a discarded, never-adopted
+        # boot's agy conversation is deleted as soon as its process is gone.
+        self.housekeeper: Any = None
         self.size = max(0, size)
         self.max_idle_s = max_idle_s
         if max_signatures is None:
@@ -218,6 +222,7 @@ class WarmPool:
             disable_slash_commands=s.disable_slash_commands,
             timing_log=s.timing_log, timing_label="pool",
             event_queue_size=s.event_queue_size, stdin_timeout_s=s.stdin_timeout_s,
+            observer=self.housekeeper,
         )
 
     async def _spawn_entry(self, sig: Signature) -> PooledEntry:
@@ -239,8 +244,7 @@ class WarmPool:
         try:
             content = sig.agent_for(conv_id)
             if content is not None and self.agents is not None:
-                # Background spawn: yields the agent-file lock to requests.
-                await self.agents.spawn(session, content, priority=False)
+                await self.agents.spawn(session, content)
             else:
                 await session.start()
                 if not await session.wait_started(self.settings.agent_start_timeout_s):

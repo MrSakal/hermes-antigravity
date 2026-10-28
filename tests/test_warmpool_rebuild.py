@@ -259,11 +259,11 @@ async def test_route_adopts_pooled_proc_and_metrics(application, settings, fake_
             assert second.json()['choices'][0]['message']['content'] == 'Hello world'
             metrics = (await client.get('/metrics')).json()
             assert metrics['warm_pool_hits'] == 1 and metrics['warm_pool_misses'] == 1
-            assert metrics['sessions_active'] == 0
+            assert metrics['processes_running'] == 0
     assert application.state.warm_pool.idle == 0  # lifespan drained it
 
 
-async def test_conversation_resume_never_uses_pool(application, settings, fake_agy):
+async def test_idle_reuse_never_uses_pool(application, settings, fake_agy):
     """A follow-up reuses its parked process; the pool is for NEW conversations."""
     fake_agy('simple', FAKE_AGY_CONV_ID='conv-pool-1')
     transport = httpx.ASGITransport(app=application)
@@ -282,19 +282,19 @@ async def test_conversation_resume_never_uses_pool(application, settings, fake_a
 
 # ── rebuild on expiry ─────────────────────────────────────────────────────────
 
-async def test_lost_agy_conversation_falls_back_to_full_fold(application, settings, fake_agy):
-    """agy silently starts a NEW conversation when --conversation points at a
-    pruned DB (stderr warning only). The bridge must detect the id mismatch and
-    refold the whole history rather than answer from the last message alone."""
-    fake_agy('lostconv')
-    settings.warm_pool_size = 0
+async def test_follow_up_after_eviction_adopts_pool_with_full_fold(application, settings, fake_agy):
+    """No --conversation resume: once the parked process is gone, a follow-up
+    takes the fresh path — adopting a warm-pool process — with the whole
+    history folded into its first turn."""
+    fake_agy('echoprompt')
     transport = httpx.ASGITransport(app=application)
     async with application.router.lifespan_context(application):
         async with httpx.AsyncClient(transport=transport, base_url='http://t') as client:
             r = await client.post('/v1/chat/completions', json=request())
             assert r.status_code == 200
-            # Evict the parked process: the follow-up must go the dormant
-            # (--conversation) route, which this fake answers with a new id.
+            pool: WarmPool = application.state.warm_pool
+            await asyncio.wait_for(pool._refill_task, 5)
+            assert pool.idle == 1
             assert await application.state.conv_manager.evict_idle() == 1
             follow = [{'role': 'user', 'content': 'hi'},
                       {'role': 'assistant', 'content': r.json()['choices'][0]['message']['content']},
@@ -302,13 +302,13 @@ async def test_lost_agy_conversation_falls_back_to_full_fold(application, settin
             r2 = await client.post('/v1/chat/completions', json=request(follow))
             assert r2.status_code == 200, r2.text
             content = r2.json()['choices'][0]['message']['content']
-            # The SECOND spawn (after the id-mismatch fallback) sees the folded
-            # transcript ("Conversation so far: ..."), not just "which word?".
+            # The folded transcript ("Conversation so far: ..."), not just
+            # "which word?".
             assert content.startswith('len=') and int(content.split(';')[0][4:]) > 60, content
+            assert pool.hits == 1
             metrics = (await client.get('/metrics')).json()
-            assert metrics['sessions_active'] == 0 and metrics['http_active'] == 0
-    stats = application.state.conv_manager.stats
-    assert stats['dormant_lost'] == 1 and stats['dormant_resumes'] == 0
+            assert metrics['processes_running'] == 0 and metrics['http_active'] == 0
+    assert application.state.conv_manager.stats['reuse_misses'] == 1
 
 def tool_messages(call_id='call_gone'):
     return [
@@ -343,7 +343,7 @@ async def test_expired_continuation_rebuilds_from_history(application, settings,
             content = r.json()['choices'][0]['message']['content']
             assert int(content.split(';')[0].split('=')[1]) > 150, content
             metrics = (await client.get('/metrics')).json()
-            assert metrics['sessions_active'] == 0 and metrics['mcp_transport_sessions'] == 0
+            assert metrics['processes_running'] == 0 and metrics['mcp_transport_sessions'] == 0
             # The rebuilt turn's process is parked for reuse, nothing busy.
             assert [c.state for c in application.state.conv_manager._conversations.values()] == ['idle']
 
@@ -357,7 +357,7 @@ async def test_expired_continuation_409_when_rebuild_disabled(application, setti
             r = await client.post('/v1/chat/completions', json=request(tool_messages(), tools=[TOOL]))
     assert r.status_code == 409
     assert r.json()['error']['code'] == 'tool_result_expired'
-    assert application.state.admission.active == 0
+    assert application.state.metrics.http_active == 0
 
 
 async def test_live_conversation_wrong_ids_is_duplicate_not_rebuilt(application, settings, fake_agy):

@@ -13,7 +13,7 @@ to dial back self-matches the throwaway port — otherwise tool turns would repo
 PID on exit. It also gets its OWN managed agent plugin
 (``~/.gemini/config/plugins/hermes-bridge-bench-<port>`` with agent
 ``hermes-bench-<port>``, removed on exit): sharing the live server's
-``hermes.md`` would serialize the two servers' spawns on one file lock, and
+agent directory would mix both servers' transient agent files and sweeps, and
 two plugins defining the same agent name would make ``--agent`` ambiguous.
 
 Scenarios (each repeated ``--iters`` times):

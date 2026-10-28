@@ -5,8 +5,8 @@ Two directions:
 * **OpenAI → agy**: split out ``system`` messages (delivered via a generated
   ``--agent`` definition, see :mod:`app.agent_config`; injected as an
   instruction preamble only as the fallback), fold the conversation into a
-  single prompt string, or — on a conversation-cache hit — pass only the
-  newest user message alongside ``--conversation <id>``.
+  single prompt string, or — when a parked process is reused — pass only the
+  newest user message.
 * **agy → OpenAI**: build SSE chunks and the non-streaming response body, and
   derive ``usage`` from the ``result`` line (input/output/thinking tokens).
 """

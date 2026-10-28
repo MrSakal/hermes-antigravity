@@ -1,4 +1,4 @@
-"""WP2: persistent processes, cross-turn reuse, dormant resume, LRU/TTL,
+"""WP2: persistent processes, cross-turn reuse, fresh start after TTL,
 warm pool for tool turns, duplicate continuations and lifecycle hardening —
 all against the persistent fake agy (init at boot, one stdin line per turn)."""
 from __future__ import annotations
@@ -21,7 +21,6 @@ from app.conversation import (
     ErrorChunk,
     TextChunk,
     ToolCallsChunk,
-    _Dormant,
 )
 from app.mcp_bridge import McpBridge
 from app.openai_models import ChatCompletionRequest
@@ -130,7 +129,7 @@ async def test_abandoned_turn_is_killed_never_parked(mgr, fake_agy, log):
         await task
     assert conv.state == "closed" and not conv.session.running
     assert conv.session.closed_event.is_set()
-    assert not mgr._idle and not mgr._dormant
+    assert not mgr._idle
 
 
 async def test_tool_loop_then_follow_up_reuses_tool_process(mgr, fake_agy, log, tmp_path):
@@ -156,29 +155,19 @@ async def test_tool_loop_then_follow_up_reuses_tool_process(mgr, fake_agy, log, 
     assert len(starts(log)) == 1
 
 
-# ── dormant resume, LRU, TTL ─────────────────────────────────────────────────
+# ── process gone: fresh start, never a resume ───────────────────────────────
 
 
-async def test_lru_eviction_keeps_conversation_resumable(mgr, fake_agy, log):
-    fake_agy("echo")
-    mgr.settings.max_sessions = 1
-    a1 = [{"role": "user", "content": "alpha"}]
-    conv_a, _ = await turn(mgr, a1)
-    conv_b, _ = await turn(mgr, [{"role": "user", "content": "beta"}])
-    # Room for B was made by evicting idle A (LRU), remembered dormant.
-    assert conv_a.state == "closed" and conv_b.state == "idle"
-    assert mgr.stats["evictions"] == 1 and len(mgr._dormant) == 1
-    follow = a1 + [{"role": "assistant", "content": "echo: alpha"}, {"role": "user", "content": "more"}]
-    conv_a2, chunks = await turn(mgr, follow)
-    assert text_of(chunks) == "echo: more"  # only the newest message, on A's agy conversation
-    last_start = starts(log)[-1]["argv"]
-    assert last_start[last_start.index("--conversation") + 1] == "conv-fake-1"
-    assert mgr.stats["dormant_resumes"] == 1
-    assert conv_b.state == "closed"  # evicted in turn to stay within max_sessions=1
-    assert mgr.count() == 1
+def assert_fresh_fold(log, prior_answer):
+    """The newest process booted without --conversation and got the whole
+    history folded into its first turn."""
+    boot = starts(log)[-1]
+    assert "--conversation" not in boot["argv"]
+    first = turns(log)[-1]["content"]
+    assert prior_answer in first and first != "r"
 
 
-async def test_idle_ttl_gc_then_resume(mgr, fake_agy, log):
+async def test_idle_ttl_gc_then_fresh_with_full_history(mgr, fake_agy, log):
     fake_agy("echo")
     m1 = [{"role": "user", "content": "q"}]
     conv, _ = await turn(mgr, m1)
@@ -186,24 +175,32 @@ async def test_idle_ttl_gc_then_resume(mgr, fake_agy, log):
     assert await mgr.gc_once() == 1
     assert conv.state == "closed" and conv.session.closed_event.is_set()
     assert conv.session._proc.returncode == 0  # graceful: stdin EOF, not a kill
+    assert mgr.referenced_agy_ids() == set()  # nothing kept for a resume
     follow = m1 + [{"role": "assistant", "content": "echo: q"}, {"role": "user", "content": "r"}]
-    _, chunks = await turn(mgr, follow)
-    assert text_of(chunks) == "echo: r" and mgr.stats["dormant_resumes"] == 1
+    conv2, chunks = await turn(mgr, follow)
+    assert conv2 is not conv and isinstance(chunks[-1], DoneChunk)
+    assert len(starts(log)) == 2 and mgr.stats["reuse_misses"] == 1
+    assert_fresh_fold(log, "echo: q")
 
 
-async def test_revival_waits_for_predecessor_exit(monkeypatch):
-    gone = asyncio.Event()
-    monkeypatch.setattr(conversation_mod, "_DORMANT_EXIT_WAIT_S", 0.1)
-    assert await ConversationManager._predecessor_gone(_Dormant("x", gone)) is False
-    monkeypatch.setattr(conversation_mod, "_DORMANT_EXIT_WAIT_S", 5)
-    waiter = asyncio.create_task(ConversationManager._predecessor_gone(_Dormant("x", gone)))
-    await asyncio.sleep(0.05)
-    assert not waiter.done()  # a resume never overlaps the previous process
-    gone.set()
-    assert await waiter is True
+async def test_tool_follow_up_after_ttl_is_a_fresh_conversation(mgr, fake_agy, log):
+    fake_agy("echo")
+    m1 = [{"role": "user", "content": "q"}]
+    conv, first = await turn(mgr, m1, tools=[TOOL])
+    first_id = conv.conv_id
+    conv.last_activity -= mgr.settings.idle_session_ttl_s + 1
+    assert await mgr.gc_once() == 1
+    assert mgr.mcp.get(first_id) is None  # closed with its process
+    follow = m1 + [{"role": "assistant", "content": text_of(first)}, {"role": "user", "content": "r"}]
+    conv2, chunks = await turn(mgr, follow, tools=[TOOL])
+    assert isinstance(chunks[-1], DoneChunk)
+    assert conv2 is not conv and conv2.conv_id != first_id
+    assert mgr.mcp.get(conv2.conv_id) is conv2.bridge
+    assert f"/mcp/{conv2.conv_id}\"" in starts(log)[-1]["agent_file"]
+    assert_fresh_fold(log, text_of(first))
 
 
-async def test_dead_idle_process_is_resumed_not_reused(mgr, fake_agy, log):
+async def test_dead_idle_process_starts_fresh_not_reused(mgr, fake_agy, log):
     fake_agy("echo")
     m1 = [{"role": "user", "content": "q"}]
     conv, _ = await turn(mgr, m1)
@@ -214,8 +211,31 @@ async def test_dead_idle_process_is_resumed_not_reused(mgr, fake_agy, log):
         await asyncio.sleep(0.02)
     follow = m1 + [{"role": "assistant", "content": "echo: q"}, {"role": "user", "content": "r"}]
     conv2, chunks = await turn(mgr, follow)
-    assert conv2 is not conv and text_of(chunks) == "echo: r"
-    assert mgr.stats["dormant_resumes"] == 1
+    assert conv2 is not conv and isinstance(chunks[-1], DoneChunk)
+    assert conv.state == "closed" and len(starts(log)) == 2
+    assert_fresh_fold(log, "echo: q")
+
+
+async def test_idle_process_dead_at_send_falls_back_to_fresh(mgr, fake_agy, log, monkeypatch):
+    """Died between the liveness check and the write: the claimed process is
+    killed and the follow-up folds the full history into a new one."""
+    from app.agy_session import AgySession
+
+    fake_agy("echo")
+    m1 = [{"role": "user", "content": "q"}]
+    conv, _ = await turn(mgr, m1)
+    real_send = AgySession.send
+
+    def dead_send(self, prompt):
+        if self is conv.session:
+            raise RuntimeError("agy process is not running (exit code 1)")
+        return real_send(self, prompt)
+    monkeypatch.setattr(AgySession, "send", dead_send)
+    follow = m1 + [{"role": "assistant", "content": "echo: q"}, {"role": "user", "content": "r"}]
+    conv2, chunks = await turn(mgr, follow)
+    assert conv2 is not conv and conv.state == "closed"
+    assert isinstance(chunks[-1], DoneChunk) and mgr.stats["reuse_hits"] == 0
+    assert_fresh_fold(log, "echo: q")
 
 
 # ── hardening ───────────────────────────────────────────────────────────────
@@ -303,7 +323,7 @@ async def test_duplicate_of_finished_continuation_is_409_not_rebuilt(application
             assert r3.status_code == 409 and r3.json()["error"]["code"] == "tool_result_expired"
             assert len(starts(log)) == 1
             metrics = (await client.get("/metrics")).json()
-            assert metrics["duplicate_continuations"] == 1 and metrics["sessions_active"] == 0
+            assert metrics["duplicate_continuations"] == 1 and metrics["processes_running"] == 0
 
 
 async def test_warm_pool_serves_tool_turns_with_late_bound_tools(settings, monkeypatch, fake_agy, log, tmp_path):
@@ -324,7 +344,7 @@ async def test_warm_pool_serves_tool_turns_with_late_bound_tools(settings, monke
             assert pool.idle == 1
             [entry] = pool._entries
             # Pre-minted conv id + registered bridge + URL baked into the agent
-            # file the pooled process booted with (read at boot, under the lock).
+            # file the pooled process booted with (read at boot, before its first line).
             assert entry.conv_id.startswith("pool") and entry.bridge is not None
             assert mgr.mcp.get(entry.conv_id) is entry.bridge
             boot = next(s for s in starts(log) if f"/mcp/{entry.conv_id}" in (s["agent_file"] or ""))
@@ -349,7 +369,7 @@ async def test_warm_pool_serves_tool_turns_with_late_bound_tools(settings, monke
             assert r3.status_code == 200 and pool.hits == hits
     assert not (tmp_path / "mcp_config.json").exists()
     agents = sorted(p.name for p in (tmp_path / "plugin" / "agents").iterdir())
-    assert agents == [".hermes.md.lock", "hermes.md"]  # + the cross-process spawn lock
+    assert agents == []  # transient files deleted after boot; no lock file
 
 
 async def test_stream_death_mid_turn_reports_error_not_stop(application, fake_agy, log):
@@ -382,74 +402,43 @@ async def test_cold_boot_failure_is_a_clean_502_with_stderr(application, fake_ag
     err = r.json()["error"]
     assert err["code"] == "upstream_start_failed" and "not signed in" in err["message"]
     mgr = application.state.conv_manager
-    assert not mgr._conversations and not mgr.mcp._registry and mgr._spawning == 0
-
-
-async def test_cancel_during_spawn_cleanup_still_closes_evicted_victims(mgr, fake_agy, log):
-    """A cancellation landing in _spawn's cleanup (here: while the manager lock
-    is contended) must neither leak the spawn slot nor strand LRU victims
-    CLOSING forever."""
-    fake_agy("echo")
-    mgr.settings.max_sessions = 1
-    victim, _ = await turn(mgr, [{"role": "user", "content": "alpha"}])
-    assert victim.state == "idle"
-    entered, release = asyncio.Event(), asyncio.Event()
-    original = mgr.agents.spawn
-
-    async def blocked(session, content, **kw):
-        entered.set()
-        await release.wait()
-        return await original(session, content, **kw)
-    mgr.agents.spawn = blocked
-    task = asyncio.create_task(mgr.start_turn(
-        ChatCompletionRequest(messages=[{"role": "user", "content": "beta"}]),
-        model="m", workdir=mgr.settings.default_workdir))
-    await entered.wait()
-    assert victim.state == "closing"
-    await mgr._lock.acquire()  # victim teardown now has to wait for the lock
-    try:
-        task.cancel()
-        await asyncio.sleep(0.05)
-        task.cancel()  # second cancel while the cleanup is waiting
-        with pytest.raises(asyncio.CancelledError):
-            await task
-        assert mgr._spawning == 0
-    finally:
-        mgr._lock.release()
-    await _wait_for(lambda: victim.session.closed_event.is_set())
-    assert victim.state == "closed" and not mgr._conversations
+    assert not mgr._conversations and not mgr.mcp._registry
 
 
 async def test_gc_reaps_conversation_stuck_closing(mgr, fake_agy, log):
     fake_agy("echo")
     conv, _ = await turn(mgr, [{"role": "user", "content": "q"}])
     async with mgr._lock:
-        mgr._retire_locked(conv, dormant=True)  # owner cancelled before closing it
+        mgr._retire_locked(conv)  # owner cancelled before closing it
     assert conv.state == "closing" and await mgr.gc_once() == 0  # within grace
     conv.closing_since -= conversation_mod._CLOSING_GRACE_S + 1
     assert await mgr.gc_once() == 1
     assert conv.state == "closed" and conv.session.closed_event.is_set()
 
 
-async def test_process_dead_at_resume_send_is_502_not_500(mgr, fake_agy, log, monkeypatch):
-    from app.agy_session import AgySession
+async def test_adopted_pool_process_dead_at_send_is_502_not_500(mgr, monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
     from app.errors import OpenAIError
 
-    fake_agy("echo")
-    m1 = [{"role": "user", "content": "q"}]
-    conv, _ = await turn(mgr, m1)
-    conv.last_activity -= mgr.settings.idle_session_ttl_s + 1
-    assert await mgr.gc_once() == 1  # parked dormant
-    real_send = AgySession.send
+    class DeadSession:
+        running = False
+        aclose = AsyncMock()
 
-    def dead_send(self, prompt):
-        if self.resumed:
+        def send(self, prompt):
             raise RuntimeError("agy process is not running (exit code 1)")
-        return real_send(self, prompt)
-    monkeypatch.setattr(AgySession, "send", dead_send)
-    follow = m1 + [{"role": "assistant", "content": "echo: q"}, {"role": "user", "content": "r"}]
+    session = DeadSession()
+    entry = SimpleNamespace(conv_id="pool-1", session=session, bridge=None)
+
+    class Pool:
+        _entries: list = []
+
+        async def acquire(self, sig):
+            return entry
+    mgr.pool = Pool()
     with pytest.raises(OpenAIError) as exc:
-        await mgr.start_turn(ChatCompletionRequest(messages=follow), model="m",
-                             workdir=mgr.settings.default_workdir)
+        await mgr.start_turn(ChatCompletionRequest(messages=[{"role": "user", "content": "q"}]),
+                             model="m", workdir=mgr.settings.default_workdir)
     assert exc.value.status_code == 502 and exc.value.code == "upstream_exited"
-    assert not mgr._conversations
+    assert not mgr._conversations and session.aclose.await_count == 1

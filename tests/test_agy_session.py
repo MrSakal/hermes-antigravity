@@ -92,7 +92,7 @@ async def test_noise_keeps_diagnostics(fake_agy, tmp_path):
 
 async def test_arg_construction(fake_agy, tmp_path):
     fake_agy("echoargs")
-    sess = make_session(tmp_path, conversation_id="prev-42", prompt="the prompt")
+    sess = make_session(tmp_path, prompt="the prompt")
     await sess.start()
     events = await drain(sess)
     await sess.aclose()
@@ -112,7 +112,7 @@ async def test_arg_construction(fake_agy, tmp_path):
     assert "--disable-slash-commands" in argv
     assert "--print-timeout" in argv and "30s" in argv
     assert "--model" in argv and "Gemini 3.7 Flash (Medium)" in argv
-    assert "--conversation" in argv and "prev-42" in argv
+    assert "--conversation" not in argv  # the server never resumes
     assert "--add-dir" in argv
     assert "--agent" not in argv
 

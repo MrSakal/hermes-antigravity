@@ -1,13 +1,14 @@
-"""The single managed agent file: frontmatter shape for agy 1.4.8 (list-form
-tools allowlist or no field, strict MCP list), write-if-changed, legacy
-cleanup, toolset-hash naming, and the spawn lock held until the process has
-read the file."""
+"""Transient per-spawn agent files: frontmatter shape for agy 1.4.8 (list-form
+tools allowlist or no field, strict MCP list), toolset-hash naming, parallel
+spawns, delete-after-first-line, startup + periodic sweeps."""
 
 from __future__ import annotations
 
 import asyncio
 import json
 import os
+import re
+import time
 
 import pytest
 
@@ -81,13 +82,18 @@ def test_server_name_is_toolset_hash():
 
 
 class _Session:
-    """Stand-in for AgySession: 'prints' its first line after ``delay``."""
+    """Stand-in for AgySession: 'prints' its first line after ``delay``,
+    having read its agent file (like agy at boot)."""
 
     def __init__(self, mgr: AgentPluginManager, delay: float = 0.0, starts: bool = True) -> None:
         self.mgr, self.delay, self.starts = mgr, delay, starts
         self.agent = None
         self.read: str | None = None
-        self.closed_while_locked: list[bool] = []
+        self.file_at_close: list[bool] = []
+
+    @property
+    def path(self):
+        return self.mgr.agents_dir / f"{self.agent}.md"
 
     async def start(self) -> None:
         pass
@@ -97,44 +103,55 @@ class _Session:
             await asyncio.sleep(timeout)
             return False
         await asyncio.sleep(self.delay)
-        # What the real process would have read at boot:
-        self.read = self.mgr.agent_file.read_text(encoding="utf-8")
+        self.read = self.path.read_text(encoding="utf-8")
         return True
 
     async def aclose(self) -> None:
-        self.closed_while_locked.append(self.mgr._lock.locked())
+        # The kill comes first; the file is deleted after it.
+        self.file_at_close.append(self.path.exists())
 
 
-async def test_spawn_writes_single_file_and_manifest(tmp_path):
+async def test_spawn_uses_a_transient_file_deleted_after_first_line(tmp_path):
     mgr = AgentPluginManager(tmp_path / "hermes-bridge")
     assert mgr.available()
     s = _Session(mgr)
     await mgr.spawn(s, render_agent("You are a pirate."))
-    assert s.agent == AGENT_NAME and "You are a pirate." in s.read
+    assert re.fullmatch(r"hermes-[0-9a-f]{12}", s.agent)
+    assert s.read.startswith(f"---\nname: {s.agent}\n") and "You are a pirate." in s.read
     manifest = json.loads((tmp_path / "hermes-bridge" / "plugin.json").read_text())
     assert manifest["name"] == "hermes-bridge"
-    await mgr.spawn(_Session(mgr), render_agent("Other."))
-    assert sorted(p.name for p in mgr.agents_dir.iterdir()) == [".hermes.md.lock", "hermes.md"]
-    assert "Other." in mgr.agent_file.read_text(encoding="utf-8")
+    # Gone once the process printed its first line; no lock file either.
+    assert sorted(p.name for p in mgr.agents_dir.iterdir()) == []
+    s2 = _Session(mgr)
+    await mgr.spawn(s2, render_agent("Other."))
+    assert s2.agent != s.agent and "Other." in s2.read
 
 
-async def test_unchanged_content_is_not_rewritten(tmp_path, monkeypatch):
+async def test_parallel_spawns_do_not_serialize_and_each_reads_its_own(tmp_path):
+    mgr = AgentPluginManager(tmp_path / "p")
+    sessions = [_Session(mgr, delay=0.5) for _ in range(10)]
+    loop = asyncio.get_running_loop()
+    t0 = loop.time()
+    await asyncio.gather(*(mgr.spawn(s, render_agent(f"persona {i}"))
+                           for i, s in enumerate(sessions)))
+    assert loop.time() - t0 < 2.0  # one after another would be >= 5 s
+    for i, s in enumerate(sessions):
+        assert f"persona {i}" in s.read
+    assert len({s.agent for s in sessions}) == 10
+    assert mgr.transient_files() == [] and mgr.booting == 0
+
+
+async def test_digest_ignores_the_per_spawn_name(tmp_path):
+    """Pool signature / reuse key = template digest; two spawns of the same
+    template get different file names but the same identity."""
     mgr = AgentPluginManager(tmp_path / "p")
     md = render_agent("same")
-    await mgr.spawn(_Session(mgr), md)
-    writes = []
-    monkeypatch.setattr(mgr, "_write_atomic", lambda *a: writes.append(a))
-    await mgr.spawn(_Session(mgr), md)
-    assert writes == []
-
-
-async def test_externally_changed_file_is_put_back(tmp_path):
-    mgr = AgentPluginManager(tmp_path / "p")
-    md = render_agent("mine")
-    await mgr.spawn(_Session(mgr), md)
-    mgr.agent_file.write_text("tampered", encoding="utf-8")
-    await mgr.spawn(_Session(mgr), md)
-    assert mgr.agent_file.read_text(encoding="utf-8") == md
+    a, b = _Session(mgr), _Session(mgr)
+    await mgr.spawn(a, md)
+    await mgr.spawn(b, md)
+    assert a.agent != b.agent
+    assert a.read.replace(a.agent, "X") == b.read.replace(b.agent, "X")
+    assert agent_digest(md) == agent_digest(render_agent("same"))
 
 
 async def test_unwritable_path(tmp_path):
@@ -146,143 +163,29 @@ async def test_unwritable_path(tmp_path):
         await mgr.spawn(_Session(mgr), "x")
 
 
-async def test_lock_held_until_process_loaded(tmp_path):
-    """A second spawn may not overwrite hermes.md before the first process
-    printed its first line (i.e. read the file)."""
-    mgr = AgentPluginManager(tmp_path / "p")
-    first, second = _Session(mgr, delay=0.3), _Session(mgr)
-    await asyncio.gather(mgr.spawn(first, render_agent("first")),
-                         mgr.spawn(second, render_agent("second")))
-    assert "first" in first.read and "second" in second.read
-
-
-async def test_start_timeout_kills_before_release(tmp_path):
-    """No proof agy read hermes.md: kill it while the file is still held, then
-    fail the spawn — never release the file to a still-starting agy."""
+async def test_start_timeout_kills_then_deletes(tmp_path):
     mgr = AgentPluginManager(tmp_path / "p", start_timeout_s=0.05)
     s = _Session(mgr, starts=False)
     with pytest.raises(SpawnTimeout):
         await mgr.spawn(s, "x")
-    assert s.closed_while_locked == [True]
-    assert not mgr._lock.locked()
+    assert s.file_at_close == [True]  # killed while the file still existed
+    assert mgr.transient_files() == [] and mgr.booting == 0
 
 
-async def test_cancelled_spawn_kills_before_release(tmp_path):
+async def test_cancelled_spawn_kills_then_deletes(tmp_path):
     mgr = AgentPluginManager(tmp_path / "p")
     s = _Session(mgr, delay=10)
     task = asyncio.create_task(mgr.spawn(s, "x"))
     await asyncio.sleep(0.05)
+    assert mgr.booting == 1 and len(mgr.transient_files()) == 1
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
-    assert s.closed_while_locked == [True]
-    assert not mgr._lock.locked()
+    assert s.file_at_close == [True]
+    assert mgr.transient_files() == [] and mgr.booting == 0
 
 
-def test_cleanup_legacy_only_touches_old_slugs(tmp_path):
-    mgr = AgentPluginManager(tmp_path / "p")
-    mgr.agents_dir.mkdir(parents=True)
-    (mgr.agents_dir / "hermes-0123456789ab.md").write_text("old")
-    (mgr.agents_dir / "hermes-fedcba987654.md").write_text("old")
-    (mgr.agents_dir / "hermes.md").write_text("current")
-    (mgr.agents_dir / "my-own-agent.md").write_text("hands off")
-    assert mgr.cleanup_legacy() == 2
-    assert sorted(p.name for p in mgr.agents_dir.iterdir()) == ["hermes.md", "my-own-agent.md"]
-    assert AgentPluginManager(tmp_path / "missing").cleanup_legacy() == 0
-
-
-def test_replace_retries_on_sharing_violation(tmp_path, monkeypatch):
-    """Windows: os.replace onto a file agy holds open → PermissionError.
-    Transient ones are retried; the content still lands."""
-    import app.agent_config as ac
-
-    target = tmp_path / "hermes.md"
-    target.write_text("old", encoding="utf-8")
-    real = os.replace
-    fails = iter([True, True])
-
-    def flaky(src, dst):
-        if next(fails, False):
-            raise PermissionError("sharing violation")
-        return real(src, dst)
-
-    monkeypatch.setattr(ac.os, "replace", flaky)
-    monkeypatch.setattr(ac, "_REPLACE_BACKOFF_S", 0.0)
-    AgentPluginManager._write_atomic(target, "new")
-    assert target.read_text(encoding="utf-8") == "new"
-    assert [p.name for p in tmp_path.iterdir()] == ["hermes.md"]  # no temp left
-
-
-# ── cross-process lock, priority, boot failure ──────────────────────────────
-
-
-async def test_two_managers_sharing_a_dir_serialize_via_the_file_lock(tmp_path):
-    """Two servers on one HOME (two managers, separate in-process locks, one
-    plugin dir): the OS file lock still keeps the second write out of the
-    first process's write -> first-stdout window."""
-    a, b = AgentPluginManager(tmp_path / "p"), AgentPluginManager(tmp_path / "p")
-    first, second = _Session(a, delay=0.3), _Session(b)
-    t1 = asyncio.create_task(a.spawn(first, render_agent("first")))
-    await asyncio.sleep(0.05)  # a holds both locks now
-    t2 = asyncio.create_task(b.spawn(second, render_agent("second")))
-    await asyncio.gather(t1, t2)
-    assert "first" in first.read and "second" in second.read
-    assert a.lock_file.exists() and a.lock_file.name == ".hermes.md.lock"
-
-
-async def test_file_lock_held_elsewhere_fails_busy_within_budget(tmp_path):
-    from app.agent_config import SpawnBusy, _try_lock
-
-    holder = AgentPluginManager(tmp_path / "p")
-    holder.agents_dir.mkdir(parents=True)
-    fd = os.open(str(holder.lock_file), os.O_RDWR | os.O_CREAT)
-    try:
-        assert _try_lock(fd)
-        mgr = AgentPluginManager(tmp_path / "p")
-        with pytest.raises(SpawnBusy):
-            await mgr.spawn(_Session(mgr), "x", budget_s=0.2)
-        assert not mgr._lock.locked()
-    finally:
-        holder._file_unlock(fd)
-
-
-async def test_request_spawns_jump_ahead_of_background_spawns(tmp_path):
-    mgr = AgentPluginManager(tmp_path / "p")
-    order: list[str] = []
-
-    class Tagged(_Session):
-        def __init__(self, tag, delay=0.0):
-            super().__init__(mgr, delay=delay)
-            self.tag = tag
-
-        async def start(self):
-            order.append(self.tag)
-
-    hold = asyncio.create_task(mgr.spawn(Tagged("holder", delay=0.2), "h"))
-    await asyncio.sleep(0.02)
-    refill = asyncio.create_task(mgr.spawn(Tagged("refill"), "r", priority=False))
-    await asyncio.sleep(0.02)
-    request = asyncio.create_task(mgr.spawn(Tagged("request"), "q"))
-    await asyncio.gather(hold, refill, request)
-    assert order == ["holder", "request", "refill"]
-
-
-async def test_queued_request_fails_fast_when_queue_outlasts_budget(tmp_path):
-    from app.agent_config import SpawnBusy
-
-    mgr = AgentPluginManager(tmp_path / "p", start_timeout_s=5)
-    hold = asyncio.create_task(mgr.spawn(_Session(mgr, delay=0.3), "h"))
-    await asyncio.sleep(0.02)
-    loop = asyncio.get_running_loop()
-    t0 = loop.time()
-    with pytest.raises(SpawnBusy):  # worst case 5 s ahead > 1 s budget
-        await mgr.spawn(_Session(mgr), "x", budget_s=1.0)
-    assert loop.time() - t0 < 0.1  # failed fast, did not wait
-    await hold
-    await mgr.spawn(_Session(mgr), "x", budget_s=1.0)  # queue empty: fine
-
-
-async def test_boot_eof_fails_spawn_with_stderr_before_release(tmp_path):
+async def test_boot_eof_fails_spawn_with_stderr_and_deletes(tmp_path):
     from app.agent_config import SpawnFailed
 
     mgr = AgentPluginManager(tmp_path / "p")
@@ -296,7 +199,157 @@ async def test_boot_eof_fails_spawn_with_stderr_before_release(tmp_path):
     s = Dead(mgr)
     with pytest.raises(SpawnFailed, match="not signed in"):
         await mgr.spawn(s, "x")
-    assert s.closed_while_locked == [True] and not mgr._lock.locked()
+    assert s.file_at_close == [True] and mgr.transient_files() == []
+
+
+async def test_start_exception_kills_then_deletes(tmp_path):
+    mgr = AgentPluginManager(tmp_path / "p")
+
+    class Boom(_Session):
+        async def start(self):
+            raise RuntimeError("agy not found")
+
+    s = Boom(mgr)
+    with pytest.raises(RuntimeError):
+        await mgr.spawn(s, "x")
+    assert s.file_at_close == [True] and mgr.transient_files() == []
+
+
+# ── housekeeping ────────────────────────────────────────────────────────────
+
+
+def _age(p, seconds):
+    t = time.time() - seconds
+    os.utime(p, (t, t))
+
+
+def test_startup_cleanup(tmp_path):
+    mgr = AgentPluginManager(tmp_path / "p", start_timeout_s=10)
+    d = mgr.agents_dir
+    d.mkdir(parents=True)
+    for name in ("hermes.md", ".hermes.md.lock",            # previous build
+                 "hermes-0123456789ab.md",                  # crash leftover / legacy
+                 "hermes-fedcba987654.md",
+                 "hermes-aaaaaaaaaaaa.md",                  # fresh: maybe another server booting
+                 "my-own-agent.md", "hermes-notes.md",      # not ours
+                 "hermes-0123456789abc.md", "hermes-0123456789xy.md"):
+        (d / name).write_text("x")
+    for name in ("hermes-0123456789ab.md", "hermes-fedcba987654.md"):
+        _age(d / name, 60)
+    assert mgr.startup_cleanup() == 4
+    assert sorted(p.name for p in d.iterdir()) == [
+        "hermes-0123456789abc.md", "hermes-0123456789xy.md", "hermes-aaaaaaaaaaaa.md",
+        "hermes-notes.md", "my-own-agent.md"]
+    assert AgentPluginManager(tmp_path / "missing").startup_cleanup() == 0
+
+
+def test_startup_cleanup_custom_name_leaves_default_agents_alone(tmp_path):
+    mgr = AgentPluginManager(tmp_path / "p", agent_name="hermes-bench-8800", start_timeout_s=1)
+    d = mgr.agents_dir
+    d.mkdir(parents=True)
+    for name in ("hermes-bench-8800-0123456789ab.md", "hermes-bench-8800.md", "hermes-x.md"):
+        (d / name).write_text("x")
+        _age(d / name, 60)
+    mgr.startup_cleanup()
+    assert sorted(p.name for p in d.iterdir()) == ["hermes-x.md"]
+
+
+async def test_periodic_sweep_skips_booting_and_young_files(tmp_path):
+    mgr = AgentPluginManager(tmp_path / "p", start_timeout_s=5)
+    s = _Session(mgr, delay=10)
+    task = asyncio.create_task(mgr.spawn(s, "x"))
+    await asyncio.sleep(0.05)
+    [booting] = mgr.transient_files()
+    _age(booting, 3600)  # even an "old" file of a live boot is never swept
+    stale = mgr.agents_dir / "hermes-0000000000aa.md"
+    young = mgr.agents_dir / "hermes-0000000000bb.md"
+    stale.write_text("x")
+    young.write_text("x")
+    _age(stale, 11)   # > 2 x start_timeout_s
+    _age(young, 9)    # < 2 x start_timeout_s
+    other = mgr.agents_dir / "someone-else-0000000000aa.md"
+    other.write_text("x")
+    _age(other, 3600)
+    assert mgr.sweep() == 1
+    assert not stale.exists() and young.exists() and other.exists() and booting.exists()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+
+async def test_gc_loop_runs_the_sweep(tmp_path, monkeypatch):
+    from app.config import Settings
+    from app.conversation import ConversationManager
+    from app.mcp_bridge import McpBridge
+
+    mgr = AgentPluginManager(tmp_path / "p", start_timeout_s=1)
+    calls = []
+    monkeypatch.setattr(mgr, "sweep", lambda **kw: calls.append(kw) or 0)
+    cm = ConversationManager(McpBridge(), Settings(_env_file=None, gc_interval_s=1,
+                                                   default_workdir=tmp_path), agents=mgr)
+    task = asyncio.create_task(cm.gc_loop())
+    await asyncio.sleep(1.3)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert calls
+
+
+async def test_windows_delete_retry_then_sweep(tmp_path, monkeypatch):
+    """agy may still hold the file a moment after its first line (Windows
+    sharing violation): retried in the background without delaying the
+    spawn; a file that stays locked is left to the sweep."""
+    import app.agent_config as ac
+
+    monkeypatch.setattr(ac, "_DELETE_BACKOFF_S", 0.01)
+    real_unlink = type(tmp_path).unlink
+    locked = {"n": 3}
+
+    def flaky(self, *a, **kw):
+        if self.suffix == ".md" and locked["n"] > 0:
+            locked["n"] -= 1
+            raise PermissionError("sharing violation")
+        return real_unlink(self, *a, **kw)
+
+    monkeypatch.setattr(type(tmp_path), "unlink", flaky)
+    mgr = AgentPluginManager(tmp_path / "p")
+    s = _Session(mgr)
+    await mgr.spawn(s, "x")  # returns at once; delete continues in background
+    assert len(mgr.transient_files()) == 1
+    await mgr.aclose()
+    assert mgr.transient_files() == []
+
+    # Locked for good: background retries give up, the sweep removes it later.
+    locked["n"] = 10**6
+    s2 = _Session(mgr)
+    await mgr.spawn(s2, "x")
+    await mgr.aclose()
+    assert len(mgr.transient_files()) == 1
+    locked["n"] = 0
+    assert mgr.sweep() == 1  # own undeleted file: no age gate
+    assert mgr.transient_files() == []
+
+
+def test_replace_retries_on_sharing_violation(tmp_path, monkeypatch):
+    """Windows: os.replace onto a file another process holds open →
+    PermissionError. Transient ones are retried; the content still lands."""
+    import app.agent_config as ac
+
+    target = tmp_path / "plugin.json"
+    target.write_text("old", encoding="utf-8")
+    real = os.replace
+    fails = iter([True, True])
+
+    def flaky(src, dst):
+        if next(fails, False):
+            raise PermissionError("sharing violation")
+        return real(src, dst)
+
+    monkeypatch.setattr(ac.os, "replace", flaky)
+    monkeypatch.setattr(ac, "_REPLACE_BACKOFF_S", 0.0)
+    AgentPluginManager._write_atomic(target, "new")
+    assert target.read_text(encoding="utf-8") == "new"
+    assert [p.name for p in tmp_path.iterdir()] == ["plugin.json"]  # no temp left
 
 
 def test_custom_agent_name_and_manifest_follow_the_dir(tmp_path):
@@ -309,7 +362,7 @@ def test_custom_agent_name_and_manifest_follow_the_dir(tmp_path):
 
 def test_bench_server_uses_its_own_plugin_and_agent(monkeypatch):
     """scripts/bench.py starts a second server on the same HOME: it must not
-    share hermes.md (or the agent name) with the live one."""
+    share the agent directory (or the agent name) with the live one."""
     import importlib.util
     from pathlib import Path
 

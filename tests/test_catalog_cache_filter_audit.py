@@ -1,20 +1,21 @@
 """Audit regressions for canonical discovery, exclusive reuse claims and bounded filtering.
 
 The history-prefix cache (``convcache``) these tests used to cover was
-subsumed by the conversation manager's IDLE/dormant reuse index; its
+subsumed by the conversation manager's IDLE reuse index; its
 invariants (structured fingerprints, namespacing, single-use atomic claims)
 are asserted against :func:`app.conversation.history_key` and
 ``ConversationManager._claim_idle`` instead."""
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
 
 from app.agent_config import AgentPluginManager
 from app.config import Settings, _FAMILY_VARIANTS, resolve_model
-from app.conversation import ConversationManager, _Dormant, history_key
+from app.conversation import Conversation, ConversationManager, history_key
 from app.main import create_app
-from app.mcp_bridge import McpBridge
+from app.mcp_bridge import ConversationBridge, McpBridge
 from app.model_catalog import ModelCatalog, ModelEntry
 from app.openai_models import ChatMessage
 from app.textfilter import TableFlattener
@@ -49,29 +50,26 @@ def test_structured_fingerprints():
         history_key('s', [msg('system', 'sys'), msg('user', 'q'), msg('assistant', 'a')])
 
 
-async def test_dormant_claim_is_single_use_and_atomic(tmp_path):
+async def test_idle_claim_is_single_use_and_atomic(tmp_path):
     mgr = ConversationManager(McpBridge(), Settings(_env_file=None, default_workdir=tmp_path),
                               agents=AgentPluginManager(tmp_path / 'plugin'))
-    gone = asyncio.Event()
-    gone.set()
     key = history_key('sig', history()[:-1])
-    mgr._dormant[key] = _Dormant('agy-1', gone)
+
+    def park(conv_id):
+        conv = Conversation(conv_id=conv_id, slot=None, session=SimpleNamespace(running=True),
+                            bridge=ConversationBridge(conv_id, []), model='m', state='idle',
+                            reuse_key=key)
+        mgr._conversations[conv_id] = conv
+        mgr._idle[key] = conv_id
+        return conv
+    conv = park('c1')
     results = await asyncio.gather(*(mgr._claim_idle(key) for _ in range(8)))
-    hits = [d for _, d in results if d is not None]
-    assert len(hits) == 1 and hits[0].agy_id == 'agy-1'
-    assert not mgr._dormant
+    hits = [c for c in results if c is not None]
+    assert hits == [conv] and conv.state == 'running'
+    assert not mgr._idle
     # Another signature never sees it.
-    mgr._dormant[key] = _Dormant('agy-1', gone)
-    assert (await mgr._claim_idle(history_key('other', history()[:-1])))[1] is None
-
-
-async def test_expired_dormant_record_misses(tmp_path):
-    settings = Settings(_env_file=None, default_workdir=tmp_path, conversation_cache_ttl_s=1)
-    mgr = ConversationManager(McpBridge(), settings, agents=AgentPluginManager(tmp_path / 'plugin'))
-    gone = asyncio.Event()
-    gone.set()
-    mgr._dormant['k'] = _Dormant('agy-1', gone, stored_at=0.0)
-    assert (await mgr._claim_idle('k'))[1] is None
+    park('c2')
+    assert await mgr._claim_idle(history_key('other', history()[:-1])) is None
 
 
 @pytest.mark.parametrize('live', [False, True])

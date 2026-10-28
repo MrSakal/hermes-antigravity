@@ -153,22 +153,6 @@ async def test_absolute_deadline_includes_batch_wait(manager):
     await asyncio.gather(task, return_exceptions=True)
 
 
-async def test_suspended_capacity_closes_excess_and_releases(manager):
-    manager.settings.max_suspended_sessions = 1
-    first, tasks, _ = await suspend(manager)
-    conv = conversation(manager, 'b')
-    release = conv.release_resources = Mock()
-    task = asyncio.create_task(conv.bridge.dispatch('allowed', {'count': 1}))
-    chunks = await collect(manager, conv)
-    assert isinstance(chunks[-1], ErrorChunk) and chunks[-1].status_code == 503
-    assert first.state == SUSPENDED and conv.state == 'closed'
-    assert not conv.bridge.pending_ids and conv.bridge._incoming.empty()
-    assert set(manager._pending_index.values()) == {'a'}
-    release.assert_called_once()
-    await manager.close_all()
-    await asyncio.gather(task, *tasks, return_exceptions=True)
-
-
 async def test_resources_held_suspended_and_released_once_on_failed_close(manager):
     conv, tasks, _ = await suspend(manager)
     release = conv.release_resources = Mock()
@@ -206,7 +190,7 @@ async def test_concurrent_close_keeps_resources_until_process_closed(manager):
 
 @pytest.mark.parametrize('failure', [OSError('disk'), asyncio.CancelledError()])
 async def test_agent_file_failure_unregisters(manager, failure):
-    manager.agents._write_if_changed = Mock(side_effect=failure)
+    manager.agents._write_atomic = Mock(side_effect=failure)
     with pytest.raises(OpenAIError if isinstance(failure, OSError) else type(failure)):
         await manager.create(ChatCompletionRequest(messages=[{'role': 'user', 'content': 'go'}]),
                              model='model', workdir=manager.settings.default_workdir)

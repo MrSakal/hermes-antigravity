@@ -1,5 +1,5 @@
-"""Managed agent plugin — ONE agent file (``hermes.md``) carrying each spawn's
-system prompt, builtin-tool allowlist and strict MCP server list.
+"""Managed agent plugin — one TRANSIENT agent file per spawn carrying that
+spawn's system prompt, builtin-tool allowlist and strict MCP server list.
 
 agy has no ``--system-prompt`` and no ``--mcp-config`` flag, but it loads
 custom agents from plugin directories (``~/.gemini/config/plugins/<name>/``
@@ -21,28 +21,39 @@ Verified live on 1.4.8:
   at the first user message, never during boot.
 * The file is read at process BOOT, always before agy prints its first stdout
   line (the ``init`` event, printed even when no prompt was sent yet).
-  Rewriting it after that line does not affect the running process.
+  Deleting it after that line changes nothing for the running process: the
+  persona applies and the MCP URL from the deleted file is still connected at
+  the first message (both checked live, with the message sent before AND
+  after the deletion).
+* agy snapshots the agent (persona + MCP servers) into the conversation it
+  creates; a ``--conversation <id>`` resume ignores ``--agent`` entirely and
+  reconnects to the ORIGINAL MCP URL. The server never resumes (an exited
+  process' conversation is deleted, see app.conversation).
 
-That last point is what makes a single shared file safe: :meth:`spawn`
-serializes every spawn (cold, resumed and warm-pool refills alike) under one
-lock, writes the file only when its bytes differ, spawns, and holds the lock
-until the process printed its first stdout line — message-free proof it has
-read the file — before the next spawn may overwrite it. The same window is
-also held under an advisory OS file lock (``agents/.hermes.md.lock``;
-``flock`` on POSIX, ``msvcrt.locking`` on Windows, polled so the event loop
-never blocks), so a second server on the same HOME cannot rewrite the file
-under our boot either. Request-driven spawns take precedence over warm-pool
-refills, and an agy that exits before its first line fails the spawn
-(:class:`SpawnFailed`, carrying its stderr tail) instead of handing out a
-dead process.
+So every spawn gets its own file, ``agents/<agent_name>-<12 hex>.md`` with a
+matching frontmatter ``name``, written right before the spawn and deleted as
+soon as the process printed its first stdout line (or right after the kill on
+timeout / boot failure / cancellation). There is no lock: request spawns,
+and warm-pool refills all boot in parallel, and a second
+server sharing the directory cannot collide either (random names). An agy that
+exits before its first line fails the spawn (:class:`SpawnFailed`, carrying
+its stderr tail) instead of handing out a dead process.
+
+Housekeeping: a delete refused with ``PermissionError`` (Windows: agy may
+still hold the handle for a moment) is retried in the background and
+otherwise left to :meth:`AgentPluginManager.sweep`, which removes our
+transient files that no in-flight spawn owns once they are older than any boot
+can take (at startup and from the GC loop). The startup sweep also removes the
+per-prompt ``hermes-<12hex>.md`` files of older builds and the single
+``<agent_name>.md`` + ``.<agent_name>.md.lock`` of the previous build. Nothing
+else in the directory is ever touched.
 
 agy caches tool schemas per server NAME in a shared folder
 (``~/.gemini/antigravity-cli/mcp/<name>/``), so the server name is unique per
 distinct toolset: ``hermes-<sha8 of the canonical tools JSON>``. The
 conversation itself is routed by the URL (``/mcp/<conv_id>``), not the name.
-
-Only this plugin directory is ever written. On startup :meth:`cleanup_legacy`
-deletes the per-prompt ``hermes-<12hex>.md`` files older builds generated.
+Warm-pool / reuse signatures are digests of the rendered TEMPLATE (base agent
+name), never of the random per-spawn file name.
 """
 
 from __future__ import annotations
@@ -54,6 +65,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import tempfile
 import time
 from dataclasses import dataclass
@@ -67,7 +79,7 @@ _LEGACY_RE = re.compile(r"^hermes-[0-9a-f]{12}\.md$")
 
 _PLUGIN_JSON = {
     "name": "hermes-bridge",
-    "version": "0.3.0",
+    "version": "0.4.0",
     "description": "System prompt + strict per-conversation MCP agent managed by antigravity-interface.",
     "author": {"name": "antigravity-interface"},
 }
@@ -84,44 +96,14 @@ TOOLS_BY_MODE: dict[str, Optional[str]] = {
 # Neutral: does not fight the client's own instructions in the user turn.
 NEUTRAL_SYSTEM_PROMPT = "You are a helpful assistant."
 
-# os.replace onto a file another process holds open fails on Windows with
-# PermissionError (sharing violation) — agy may be reading hermes.md right
-# then. Retry briefly before giving up.
+# os.replace / os.unlink on a file another process holds open fails on Windows
+# with PermissionError (sharing violation). Retry briefly before giving up.
 _REPLACE_RETRIES = 5
 _REPLACE_BACKOFF_S = 0.05
-
-# Poll interval of the cross-process agent-file lock (never a blocking call on
-# the event loop).
-_FILE_LOCK_POLL_S = 0.05
-
-if os.name == "nt":  # pragma: no cover - exercised on Windows
-    import msvcrt
-
-    def _try_lock(fd: int) -> bool:
-        os.lseek(fd, 0, os.SEEK_SET)
-        try:
-            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
-            return True
-        except OSError:
-            return False
-
-    def _unlock(fd: int) -> None:
-        os.lseek(fd, 0, os.SEEK_SET)
-        with contextlib.suppress(OSError):
-            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
-else:
-    import fcntl
-
-    def _try_lock(fd: int) -> bool:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            return True
-        except (BlockingIOError, PermissionError):
-            return False
-
-    def _unlock(fd: int) -> None:
-        with contextlib.suppress(OSError):
-            fcntl.flock(fd, fcntl.LOCK_UN)
+# Background delete retries of a transient file agy still holds (Windows);
+# whatever survives them is left to the sweep.
+_DELETE_RETRIES = 8
+_DELETE_BACKOFF_S = 0.25
 
 
 class AgentUnavailable(Exception):
@@ -130,22 +112,14 @@ class AgentUnavailable(Exception):
 
 
 class SpawnTimeout(Exception):
-    """agy printed nothing within ``start_timeout_s`` of spawning, so there is
-    no proof it has read the agent file. The process is killed and the spawn
-    fails: releasing the lock instead would let a slow agy read the NEXT
-    spawn's file (wrong system prompt, wrong tools, wrong MCP URL)."""
+    """agy printed nothing within ``start_timeout_s`` of spawning. The process
+    is killed (then its agent file deleted) and the spawn fails."""
 
 
 class SpawnFailed(Exception):
     """agy exited during boot without printing a single stdout line (not
     signed in, unknown model, rejected agent frontmatter, ...). ``str()``
     carries agy's stderr tail / exit code."""
-
-
-class SpawnBusy(Exception):
-    """The spawn could not get the agent-file lock within its budget — the
-    queue ahead of it (in this process or in another server sharing the
-    plugin directory) would outlast the request. Rendered as 503."""
 
 
 @dataclass(frozen=True)
@@ -175,7 +149,7 @@ def server_name_for(tools: Optional[list[Any]]) -> str:
 
 
 def agent_digest(content: str) -> str:
-    """Identity of a rendered agent file (warm-pool signature, cache namespace)."""
+    """Identity of a rendered agent template (warm-pool signature, cache namespace)."""
     return hashlib.sha256(content.encode("utf-8", "surrogatepass")).hexdigest()[:16]
 
 
@@ -192,8 +166,9 @@ def render_agent(
     inherit_mcp: bool = False,
     name: str = AGENT_NAME,
 ) -> str:
-    """The full ``hermes.md`` content for one spawn (``name`` must match the
-    managing :attr:`AgentPluginManager.agent_name`)."""
+    """The agent TEMPLATE for one spawn (``name`` must be the managing
+    :attr:`AgentPluginManager.agent_name`; :meth:`AgentPluginManager.spawn`
+    swaps in the per-spawn file name)."""
     if tools_mode not in TOOLS_BY_MODE:
         raise ValueError(f"unknown tools mode {tools_mode!r}")
     lines = [
@@ -216,25 +191,24 @@ def render_agent(
 
 
 class AgentPluginManager:
-    """Owns the managed plugin directory and its single agent file."""
+    """Owns the managed plugin directory and its transient per-spawn agents."""
 
     def __init__(self, path: Optional[Path] = None, *, start_timeout_s: float = 30.0,
                  agent_name: str = AGENT_NAME) -> None:
         self.path = Path(path).expanduser() if path else default_plugin_path()
         # A second server on the same HOME (scripts/bench.py) uses its own
-        # plugin dir AND agent name: two plugins defining one agent name would
-        # make ``--agent`` ambiguous.
+        # plugin dir AND agent name, so neither sweeps the other's files.
         self.agent_name = agent_name
         self.start_timeout_s = start_timeout_s
-        self._lock = asyncio.Lock()
-        # Request-driven spawns waiting for (or holding) _lock. Background
-        # spawns (warm-pool refills) only take the lock while this is 0.
-        self._urgent = 0
-        self._no_urgent = asyncio.Event()
-        self._no_urgent.set()
+        self._transient_re = re.compile(rf"^{re.escape(agent_name)}-[0-9a-f]{{12}}\.md$")
+        # Transient files of spawns still booting (never swept).
+        self._booting: set[Path] = set()
+        # Background delete retries (strong refs) and our files they have not
+        # removed yet.
+        self._deleters: set[asyncio.Task] = set()
+        self._undeleted: set[Path] = set()
         # available() is on every request's path; once the directory and
-        # manifest exist, skip the filesystem round trip (a spawn re-ensures
-        # both under the lock anyway, see _write_if_changed).
+        # manifest exist, skip the filesystem round trip.
         self._ensured = False
 
     @property
@@ -243,13 +217,25 @@ class AgentPluginManager:
 
     @property
     def agent_file(self) -> Path:
+        """The single shared file of the previous build (removed at startup)."""
         return self.agents_dir / f"{self.agent_name}.md"
 
     @property
     def lock_file(self) -> Path:
-        """Cross-process advisory lock next to ``hermes.md`` (not ``*.md``, so
-        agy never mistakes it for an agent)."""
+        """The previous build's cross-process lock file (removed at startup)."""
         return self.agents_dir / f".{self.agent_name}.md.lock"
+
+    @property
+    def booting(self) -> int:
+        """Spawns between file write and first stdout line (metrics / tests)."""
+        return len(self._booting)
+
+    def transient_files(self) -> list[Path]:
+        """Our per-spawn agent files currently on disk."""
+        try:
+            return sorted(p for p in self.agents_dir.iterdir() if self._transient_re.match(p.name))
+        except OSError:
+            return []
 
     # ── public API ───────────────────────────────────────────────────────────
 
@@ -269,180 +255,177 @@ class AgentPluginManager:
             logger.warning("agent-plugin: cannot manage %s", self.path, exc_info=True)
             return False
 
-    async def spawn(self, session: Any, content: str, *, priority: bool = True,
-                    budget_s: Optional[float] = None) -> None:
-        """Start ``session`` with ``--agent hermes`` reading exactly ``content``.
+    async def spawn(self, session: Any, content: str) -> None:
+        """Start ``session`` with ``--agent <agent_name>-<hex>``: a fresh file
+        holding exactly ``content`` (a :func:`render_agent` template; its
+        ``name:`` line is rewritten to the per-spawn name).
 
-        Holds the in-process lock AND the cross-process file lock from the
-        file write through the process's first stdout line. Any failure or
-        cancellation in between kills and reaps the process BEFORE the locks
-        are released.
-
-        ``priority`` (request-driven spawns) jumps ahead of background spawns
-        (``priority=False``: warm-pool refills), which only take the lock while
-        no request spawn is queued. ``budget_s`` bounds the time spent waiting
-        for the locks; a queue that would outlast it fails fast.
+        The file is deleted once the process printed its first stdout line —
+        agy has read it by then — or, after the kill, on any failure or
+        cancellation in between. Never waits on another spawn.
 
         Raises :class:`AgentUnavailable` (file not writable),
-        :class:`SpawnBusy` (lock budget exceeded), :class:`SpawnTimeout` (no
-        output) or :class:`SpawnFailed` (agy exited during boot).
+        :class:`SpawnTimeout` (no output within ``start_timeout_s``) or
+        :class:`SpawnFailed` (agy exited during boot).
         """
-        loop = asyncio.get_running_loop()
-        deadline = None if budget_s is None else loop.time() + max(0.0, budget_s)
-        await self._acquire(priority, deadline)
+        name = f"{self.agent_name}-{secrets.token_hex(6)}"
+        path = self.agents_dir / f"{name}.md"
         try:
-            lock_budget = (self.start_timeout_s * 2 + 5.0 if deadline is None
-                           else deadline - loop.time())
-            fd = await self._file_lock(lock_budget)
-            try:
-                await self._spawn_locked(session, content)
-            finally:
-                self._file_unlock(fd)
-        finally:
-            self._lock.release()
-
-    async def _spawn_locked(self, session: Any, content: str) -> None:
-        # Synchronous on purpose: a write running in a worker thread could
-        # outlive a cancelled spawn and land after the NEXT spawn's write.
-        try:
-            self._write_if_changed(content)
+            self._ensure_plugin()
+            self._write_atomic(path, self._personalize(content, name))
         except OSError as e:
             self._ensured = False
-            logger.warning("agent-plugin: cannot write %s", self.agent_file, exc_info=True)
+            logger.warning("agent-plugin: cannot write %s", path, exc_info=True)
             raise AgentUnavailable(str(e)) from e
-        session.agent = self.agent_name
+        self._booting.add(path)
         try:
-            await session.start()
-            loaded = await session.wait_started(self.start_timeout_s)
-        except BaseException:
-            await session.aclose()
-            raise
-        if not loaded:
-            logger.warning(
-                "agent-plugin: no output from agy within %.0fs; killing it before "
-                "the agent file is released", self.start_timeout_s,
-            )
-            await session.aclose()
-            raise SpawnTimeout(f"agy did not start within {self.start_timeout_s:.0f}s")
-        if getattr(session, "boot_failed", False):
+            session.agent = name
             try:
-                diag = await session.exit_diagnostics()
-            finally:
+                await session.start()
+                loaded = await session.wait_started(self.start_timeout_s)
+            except BaseException:
                 await session.aclose()
-            raise SpawnFailed(f"agy exited during startup ({diag})")
-
-    # ── locking ──────────────────────────────────────────────────────────────
-
-    async def _acquire(self, priority: bool, deadline: Optional[float]) -> None:
-        """Take ``_lock``: request spawns first, background spawns only while
-        none is queued. A request spawn whose queue would outlast its budget
-        (one ``start_timeout_s`` per spawn ahead, the worst case) fails fast."""
-        loop = asyncio.get_running_loop()
-        if not priority:
-            while True:
-                await self._no_urgent.wait()
-                if deadline is None:
-                    await self._lock.acquire()
-                else:
-                    try:
-                        async with asyncio.timeout_at(deadline):
-                            await self._lock.acquire()
-                    except TimeoutError:
-                        raise SpawnBusy("agent spawn queue is busy") from None
-                if self._urgent == 0:
-                    return
-                self._lock.release()  # a request spawn queued meanwhile: yield
-        if deadline is not None and self._lock.locked():
-            ahead = self._urgent + 1  # queued request spawns + the current holder
-            if ahead * self.start_timeout_s >= deadline - loop.time():
-                # The worst case of the queue ahead (each holder bounded by
-                # start_timeout_s) would outlast this request.
-                raise SpawnBusy(f"{ahead} agy spawn(s) queued ahead; retry later")
-        self._urgent += 1
-        self._no_urgent.clear()
-        try:
-            if deadline is None:
-                await self._lock.acquire()
-            else:
+                raise
+            if not loaded:
+                logger.warning("agent-plugin: no output from agy within %.0fs; killing it",
+                               self.start_timeout_s)
+                await session.aclose()
+                raise SpawnTimeout(f"agy did not start within {self.start_timeout_s:.0f}s")
+            if getattr(session, "boot_failed", False):
                 try:
-                    async with asyncio.timeout_at(deadline):
-                        await self._lock.acquire()
-                except TimeoutError:
-                    raise SpawnBusy("timed out waiting for the agent spawn queue") from None
+                    diag = await session.exit_diagnostics()
+                finally:
+                    await session.aclose()
+                raise SpawnFailed(f"agy exited during startup ({diag})")
         finally:
-            self._urgent -= 1
-            if self._urgent == 0:
-                self._no_urgent.set()
+            self._booting.discard(path)
+            self._delete(path)
 
-    async def _file_lock(self, budget_s: float) -> Optional[int]:
-        """Advisory OS lock on :attr:`lock_file`, held for the same write →
-        first-stdout window as ``_lock``: a second server sharing this plugin
-        directory (same HOME) must not rewrite ``hermes.md`` under our boot.
-        Polled non-blocking so the event loop never blocks. Returns the fd, or
-        None when the lock file cannot be created (the in-process lock still
-        holds; :meth:`_write_if_changed` then reports the real error)."""
-        try:
-            self.agents_dir.mkdir(parents=True, exist_ok=True)
-            fd = os.open(str(self.lock_file), os.O_RDWR | os.O_CREAT, 0o600)
-        except OSError:
-            logger.warning("agent-plugin: cannot open %s; cross-process lock skipped",
-                           self.lock_file, exc_info=True)
-            return None
-        loop = asyncio.get_running_loop()
-        end = loop.time() + max(0.0, budget_s)
-        try:
-            while not _try_lock(fd):
-                if loop.time() >= end:
-                    raise SpawnBusy("another server holds the agent file lock")
-                await asyncio.sleep(_FILE_LOCK_POLL_S)
-        except BaseException:
-            os.close(fd)
-            raise
-        return fd
+    def startup_cleanup(self) -> int:
+        """Startup housekeeping: the previous build's single agent file + lock
+        file, legacy per-prompt files and leftover transient files (a crash
+        between write and delete). Returns the count removed.
 
-    @staticmethod
-    def _file_unlock(fd: Optional[int]) -> None:
-        if fd is None:
-            return
-        try:
-            _unlock(fd)
-        finally:
-            os.close(fd)
-
-    def cleanup_legacy(self) -> int:
-        """Delete per-prompt ``hermes-<12hex>.md`` files from older builds
-        (ours only — foreign agents are never touched). Returns the count."""
+        Transient files younger than one boot window are kept: they may belong
+        to another server booting right now on the same directory; the
+        periodic :meth:`sweep` removes them once stale."""
         removed = 0
+        for p in (self.agent_file, self.lock_file):
+            if self._unlink_quiet(p):
+                removed += 1
         try:
             entries = list(self.agents_dir.iterdir())
         except OSError:
-            return 0
+            entries = []
         for p in entries:
-            if _LEGACY_RE.match(p.name):
-                try:
-                    p.unlink()
+            if _LEGACY_RE.match(p.name) and not self._transient_re.match(p.name):
+                if self._unlink_quiet(p):
                     removed += 1
-                except OSError:
-                    logger.warning("agent-plugin: could not delete legacy %s", p.name)
+        removed += self.sweep(min_age_s=self.start_timeout_s + 5.0)
         if removed:
-            logger.info("agent-plugin: removed %d legacy per-prompt agent file(s)", removed)
+            logger.info("agent-plugin: startup cleanup removed %d file(s)", removed)
         return removed
+
+    # Older name (pre-transient builds).
+    cleanup_legacy = startup_cleanup
+
+    def sweep(self, *, min_age_s: Optional[float] = None) -> int:
+        """Delete our transient agent files that no in-flight spawn owns and
+        that are older than ``min_age_s`` (default: 2x ``start_timeout_s``,
+        longer than any boot may take). Returns the count removed."""
+        if min_age_s is None:
+            min_age_s = 2 * self.start_timeout_s
+        horizon = time.time() - max(0.0, min_age_s)
+        removed = 0
+        # Our own files whose delete failed earlier: no age gate needed.
+        for p in list(self._undeleted - self._booting):
+            if self._unlink_quiet(p):
+                removed += 1
+            if not p.exists():
+                self._undeleted.discard(p)
+        for p in self.transient_files():
+            if p in self._booting:
+                continue
+            try:
+                if p.stat().st_mtime > horizon:
+                    continue
+            except OSError:
+                continue
+            if self._unlink_quiet(p):
+                removed += 1
+                self._undeleted.discard(p)
+        if removed:
+            logger.info("agent-plugin: swept %d stale transient agent file(s)", removed)
+        return removed
+
+    async def aclose(self) -> None:
+        """Shutdown: finish background deletes, then one last attempt on our
+        own files they could not remove (never another server's)."""
+        if self._deleters:
+            await asyncio.gather(*list(self._deleters), return_exceptions=True)
+        for p in list(self._undeleted):
+            if self._unlink_quiet(p) or not p.exists():
+                self._undeleted.discard(p)
 
     # ── internals ────────────────────────────────────────────────────────────
 
-    def _write_if_changed(self, content: str) -> None:
-        self._ensure_plugin()
-        target = self.agent_file
-        want = content.encode("utf-8", "replace")
+    def _personalize(self, content: str, name: str) -> str:
+        head = f"---\nname: {self.agent_name}\n"
+        if content.startswith(head):
+            return f"---\nname: {name}\n" + content[len(head):]
+        return content
+
+    def _delete(self, path: Path) -> None:
+        """Delete a transient file now; on PermissionError (Windows: agy still
+        holds it) retry in the background, then leave it to :meth:`sweep`."""
         try:
-            if target.read_bytes() == want:
-                return
-        except OSError:
+            path.unlink()
+            return
+        except FileNotFoundError:
+            return
+        except PermissionError:
             pass
-        self._write_atomic(target, content)
-        logger.debug("agent-plugin: wrote %s", target)
+        except OSError:
+            self._undeleted.add(path)
+            logger.warning("agent-plugin: could not delete %s; left to the sweep", path.name)
+            return
+        self._undeleted.add(path)
+        try:
+            task = asyncio.get_running_loop().create_task(self._delete_later(path))
+        except RuntimeError:  # no loop (sync caller): the sweep handles it
+            return
+        self._deleters.add(task)
+        task.add_done_callback(self._deleters.discard)
+
+    async def _delete_later(self, path: Path) -> None:
+        for _ in range(_DELETE_RETRIES):
+            await asyncio.sleep(_DELETE_BACKOFF_S)
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+            except PermissionError:
+                continue
+            except OSError:
+                break
+            self._undeleted.discard(path)
+            return
+        logger.info("agent-plugin: %s still locked; left to the sweep", path.name)
+
+    @staticmethod
+    def _unlink_quiet(p: Path) -> bool:
+        try:
+            p.unlink()
+            return True
+        except FileNotFoundError:
+            return False
+        except OSError:
+            logger.warning("agent-plugin: could not delete %s", p.name)
+            return False
 
     def _ensure_plugin(self) -> None:
+        if self._ensured and self.agents_dir.is_dir():
+            return
         self.agents_dir.mkdir(parents=True, exist_ok=True)
         manifest = self.path / "plugin.json"
         manifest_json = dict(_PLUGIN_JSON, name=self.path.name or _PLUGIN_JSON["name"])
@@ -457,7 +440,7 @@ class AgentPluginManager:
 
     @staticmethod
     def _write_atomic(target: Path, content: str) -> None:
-        fd, tmp = tempfile.mkstemp(dir=str(target.parent), suffix=".tmp")
+        fd, tmp = tempfile.mkstemp(dir=str(target.parent), prefix=".agi-", suffix=".tmp")
         try:
             # errors="replace": a lone surrogate in a client's system prompt
             # must not make the file unwritable.

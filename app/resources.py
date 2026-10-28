@@ -1,4 +1,4 @@
-"""Bounded admission, request validation and reference-safe attachment retention."""
+"""Metrics, request validation and reference-safe attachment retention."""
 from __future__ import annotations
 
 import asyncio
@@ -13,7 +13,7 @@ import time
 from collections import Counter, deque
 from pathlib import Path
 from typing import Callable
-import anyio
+
 from jsonschema.validators import validator_for
 from jsonschema.exceptions import SchemaError
 
@@ -36,53 +36,6 @@ class Metrics:
                 "sample_window": 1024, "duration_s_p50": percentile(self.duration, .5),
                 "duration_s_p95": percentile(self.duration, .95),
                 "ttft_s_p50": percentile(self.ttft, .5), "ttft_s_p95": percentile(self.ttft, .95)}
-
-
-class Admission:
-    """A session permit stays held across MCP suspensions, not just HTTP turns."""
-    def __init__(self, limit: int, max_waiters: int, timeout: float, metrics: Metrics):
-        self.limit, self.max_waiters, self.timeout = limit, max_waiters, timeout
-        self.active = self.waiting = 0
-        self._sem = asyncio.Semaphore(limit)
-        self.metrics = metrics
-
-    async def acquire(self, request=None) -> Callable[[], None]:
-        if self.active >= self.limit and self.waiting >= self.max_waiters:
-            self.metrics.counters['admission_rejected'] += 1
-            raise OpenAIError('session capacity reached', status_code=503, code='server_overloaded')
-        self.waiting += 1
-        waiter = asyncio.create_task(self._sem.acquire())
-        claimed = False
-        try:
-            deadline = time.monotonic() + self.timeout
-            while not waiter.done():
-                if request is not None and await request.is_disconnected():
-                    raise OpenAIError('client disconnected while queued', status_code=499, code='client_disconnected')
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    self.metrics.counters['admission_timeouts'] += 1
-                    raise OpenAIError('session admission timeout', status_code=503, code='server_overloaded')
-                await asyncio.wait({waiter}, timeout=min(.1, remaining))
-            waiter.result()
-            claimed = True
-            self.active += 1
-        finally:
-            self.waiting -= 1
-            if not claimed:
-                with anyio.CancelScope(shield=True):
-                    if not waiter.done():
-                        waiter.cancel()
-                    result = await asyncio.gather(waiter, return_exceptions=True)
-                    if result == [True]:
-                        self._sem.release()
-        released = False
-        def release():
-            nonlocal released
-            if not released:
-                released = True
-                self.active -= 1
-                self._sem.release()
-        return release
 
 
 def validate_request(req, settings) -> dict[str, bytes]:
@@ -169,6 +122,13 @@ class AttachmentStore:
         self.interval = settings.attachment_gc_interval_s
         self.pins = Counter()
         self.workdirs = {settings.default_workdir.resolve()}
+        # Set by main: records a workdir in the housekeeping ledger.
+        self.on_workdir: Callable[[Path], None] | None = None
+
+    def add_workdirs(self, workdirs) -> None:
+        """Workdirs earlier runs used (from the ledger): GC them too."""
+        for w in workdirs:
+            self.workdirs.add(Path(w).resolve())
 
     @staticmethod
     def _files(workdir):
@@ -199,6 +159,8 @@ class AttachmentStore:
     def pin_and_write(self, workdir: Path, images: dict[str, bytes]) -> Callable[[], None]:
         workdir = workdir.resolve()
         self.workdirs.add(workdir)
+        if self.on_workdir is not None:
+            self.on_workdir(workdir)  # ledger: GC'd across restarts, purged
         self.gc()
         directory = workdir/'attachments'
         files = self._files(workdir)

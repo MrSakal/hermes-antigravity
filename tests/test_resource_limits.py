@@ -13,7 +13,7 @@ import app.routes.chat as chat
 from app.config import Settings
 from app.errors import OpenAIError
 from app.openai_models import ChatCompletionRequest
-from app.resources import Admission, AttachmentStore, Metrics, validate_request
+from app.resources import AttachmentStore, Metrics, validate_request
 
 
 def request(**kwargs):
@@ -38,43 +38,6 @@ def application(settings, monkeypatch):
     monkeypatch.setattr(main, 'get_settings', lambda:settings)
     monkeypatch.setattr(chat, 'get_settings', lambda:settings)
     return main.create_app()
-
-
-async def test_admission_rejects_and_releases_exactly_once():
-    pool = Admission(1, 0, .05, Metrics())
-    release = await pool.acquire()
-    with pytest.raises(OpenAIError) as error:
-        await pool.acquire()
-    assert error.value.status_code == 503
-    assert pool.active == 1
-    release(); release()
-    assert pool.active == 0
-    (await pool.acquire())()
-    assert pool.active == 0
-
-
-async def test_admission_cancelled_waiter_does_not_leak_permit():
-    pool = Admission(1, 1, 1, Metrics())
-    release = await pool.acquire()
-    task = asyncio.create_task(pool.acquire())
-    await asyncio.sleep(.01)
-    task.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await task
-    release()
-    assert pool.waiting == 0
-    (await asyncio.wait_for(pool.acquire(), .3))()
-    assert pool.active == 0
-
-
-async def test_admission_timeout():
-    pool = Admission(1, 1, .02, Metrics())
-    release = await pool.acquire()
-    with pytest.raises(OpenAIError) as error:
-        await pool.acquire()
-    assert error.value.code == 'server_overloaded'
-    release()
-    assert pool.waiting == pool.active == 0
 
 
 @pytest.mark.parametrize('choice', ['required', {'type':'function','function':{'name':'foo'}}])
@@ -163,7 +126,6 @@ async def test_body_limit_before_parsing(application, settings):
         result = await client.post('/v1/chat/completions', content=b'x'*65)
     assert result.status_code == 413
     assert application.state.metrics.http_active == 0
-    assert application.state.admission.active == 0
 
 
 async def test_chunked_body_limit(application, settings):
@@ -198,7 +160,7 @@ async def test_resource_cleanup_and_metrics_after_plain_turn(application, fake_a
         metrics = (await client.get('/metrics')).json()
     assert result.status_code == 200, result.text
     assert result.headers['x-agi-ignored-parameters'] == 'max_tokens'
-    assert metrics['sessions_active'] == 0
+    assert metrics['processes_running'] == 0
     assert metrics['attachment_workspaces_pinned'] == 0
     assert metrics['http_active'] == 0
     assert metrics['ttft_s_p50'] is not None
@@ -225,12 +187,12 @@ async def test_readiness_is_not_fabricated(application):
     assert ready.json()['inference_probe'] is False
 
 
-async def test_invalid_tool_schema_is_http_400_without_acquisition(application):
+async def test_invalid_tool_schema_is_http_400_without_side_effects(application):
     tool = {'function': {'name': 'bad', 'parameters': {'type': 'NOT_A_JSON_TYPE'}}}
     async with httpx.AsyncClient(transport=httpx.ASGITransport(app=application, raise_app_exceptions=False), base_url='http://audit') as client:
         result = await client.post('/v1/chat/completions', json=request(tools=[tool]).model_dump())
     assert result.status_code == 400, result.text
     assert result.json()['error']['param'] == 'tools'
-    assert application.state.admission.active == 0
+    assert application.state.metrics.http_active == 0
     assert not application.state.mcp._registry
     assert not application.state.settings.default_workdir.exists()

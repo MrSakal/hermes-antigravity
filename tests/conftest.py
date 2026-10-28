@@ -22,6 +22,33 @@ def _no_warm_pool_by_default(monkeypatch):
     monkeypatch.setenv("AGI_WARM_POOL_SIZE", "0")
 
 
+@pytest.fixture(autouse=True)
+def _isolated_footprint(monkeypatch, tmp_path_factory):
+    """Never let a test touch the real state dir or ~/.gemini/antigravity-cli:
+    the housekeeper deletes from there."""
+    monkeypatch.setenv("AGI_STATE_DIR", str(tmp_path_factory.mktemp("agi-state")))
+    monkeypatch.setenv("AGI_AGY_STATE_ROOT", str(tmp_path_factory.mktemp("agy-root")))
+
+
+@pytest.fixture
+def agent_writes(monkeypatch):
+    """Contents of every transient agent file written (in order). The files
+    themselves are deleted once agy printed its first line, so tests assert
+    on what was written instead of what is left on disk."""
+    from app.agent_config import AgentPluginManager
+
+    seen: list[str] = []
+    orig = AgentPluginManager._write_atomic
+
+    def record(target, content):
+        if target.suffix == ".md":
+            seen.append(content)
+        return orig(target, content)
+
+    monkeypatch.setattr(AgentPluginManager, "_write_atomic", staticmethod(record))
+    return seen
+
+
 @pytest.fixture
 def fake_agy(monkeypatch):
     """Route AgySession spawns to tests/fake_agy.py.

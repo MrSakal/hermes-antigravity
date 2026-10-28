@@ -40,23 +40,16 @@ async def metrics(request: Request):
     conversations = list(mgr._conversations.values()) if mgr else []
     stats = mgr.stats if mgr else {}
     pool = state.warm_pool
-    data.update(sessions_active=state.admission.active,
-                sessions_capacity=state.admission.limit,
-                sessions_waiting=state.admission.waiting,
-                sessions_suspended=sum(c.state == 'suspended' for c in conversations),
+    data.update(sessions_suspended=sum(c.state == 'suspended' for c in conversations),
                 # Live agy processes owned by conversations (busy + parked
-                # IDLE; max_sessions caps this by LRU-evicting IDLE ones) and
+                # IDLE; unbounded, IDLE ones leave only via the idle TTL) and
                 # the warm pool on top.
                 processes_live=mgr.count() if mgr else 0,
                 processes_idle=sum(c.state == 'idle' for c in conversations),
                 processes_running=sum(c.state == 'running' for c in conversations),
                 processes_total=(mgr.count() if mgr else 0) + pool.idle,
-                dormant_conversations=len(mgr._dormant) if mgr else 0,
                 reuse_hits=stats.get('reuse_hits', 0),
                 reuse_misses=stats.get('reuse_misses', 0),
-                dormant_resumes=stats.get('dormant_resumes', 0),
-                dormant_lost=stats.get('dormant_lost', 0),
-                idle_evictions=stats.get('evictions', 0),
                 duplicate_continuations=stats.get('duplicates_rejected', 0),
                 tool_stdout_queue_depth=sum(c.session._queue.qsize() for c in conversations
                                             if hasattr(c.session, '_queue')),
@@ -69,6 +62,13 @@ async def metrics(request: Request):
                 warm_pool_spawn_failures=pool.spawn_failures,
                 warm_pool_targets=len(pool._targets),
                 attachment_workspaces_pinned=len(state.attachments.pins))
+    hk = getattr(state, 'housekeeper', None)
+    if hk is not None:
+        # Ledger conversations still on disk (live or parked processes) and the
+        # running totals of what housekeeping removed.
+        data.update(housekeeping_active=hk.active, ledger_conversations=len(hk.owned),
+                    housekeeping_deleted=hk.stats['deleted'],
+                    housekeeping_killed=hk.stats['killed'])
     return data
 
 

@@ -128,7 +128,7 @@ async def test_follow_up_reuses_the_parked_process(client, fake_agy):
     assert mgr.stats["reuse_hits"] == 1
     metrics = (await http.get("/metrics")).json()
     assert metrics["reuse_hits"] == 1 and metrics["processes_idle"] == 1
-    assert metrics["sessions_active"] == 0  # the permit is released at park
+    assert metrics["processes_running"] == 0  # parked IDLE, not running
 
     # An edited history (the client changed the assistant text) never adopts it.
     edited = first + [{"role": "assistant", "content": "something else"},
@@ -140,7 +140,7 @@ async def test_follow_up_reuses_the_parked_process(client, fake_agy):
     await mgr.close_all()
 
 
-async def test_tools_request_without_tool_use_completes(client, fake_agy, tmp_path):
+async def test_tools_request_without_tool_use_completes(client, fake_agy, tmp_path, agent_writes):
     """A tools-bearing request whose model never calls a tool ends as a normal
     completion — and the per-conversation MCP config entry is added/removed."""
     fake_agy("simple")
@@ -155,13 +155,13 @@ async def test_tools_request_without_tool_use_completes(client, fake_agy, tmp_pa
     assert body["choices"][0]["message"]["content"]
     # The MCP server rides in the agent file; the shared config is never written.
     assert not (tmp_path / "mcp_config.json").exists()
-    agent_md = (tmp_path / "agent-plugin" / "agents" / "hermes.md").read_text()
+    agent_md = agent_writes[-1]
     assert "inheritMcp: false" in agent_md and "mcpServers:" in agent_md
 
 
-async def test_system_message_materializes_agent(client, fake_agy, tmp_path):
-    """A system message becomes the body of the ONE managed agent file
-    (delivered to agy via --agent hermes) instead of a prompt preamble."""
+async def test_system_message_materializes_agent(client, fake_agy, tmp_path, agent_writes):
+    """A system message becomes the body of the transient agent file
+    (delivered via --agent hermes-<hex>, its per-spawn file) instead of a prompt preamble."""
     fake_agy("simple")
     http, _ = client
     r = await http.post("/v1/chat/completions", json={
@@ -171,9 +171,10 @@ async def test_system_message_materializes_agent(client, fake_agy, tmp_path):
         ],
     })
     assert r.status_code == 200
-    agents = list((tmp_path / "agent-plugin" / "agents").glob("*.md"))
-    assert [p.name for p in agents] == ["hermes.md"]
-    assert "You are a pirate." in agents[0].read_text()
+    assert len(agent_writes) == 1 and "You are a pirate." in agent_writes[0]
+    assert agent_writes[0].startswith("---\nname: hermes-")  # per-spawn name
+    # Deleted once agy printed its first line: nothing is left behind.
+    assert not list((tmp_path / "agent-plugin" / "agents").glob("*.md"))
 
 
 async def test_agent_mode_disabled_writes_nothing(client, fake_agy, tmp_path, monkeypatch):
@@ -332,7 +333,7 @@ async def test_live_catalog_model_resolves(client, fake_agy):
         assert r.json()["model"] == "Gemini 9.9 Flash (High)"
 
 
-async def test_plain_chat_agent_is_readonly_by_default(client, fake_agy, tmp_path):
+async def test_plain_chat_agent_is_readonly_by_default(client, fake_agy, tmp_path, agent_writes):
     """Requests without `tools` are answered by an agent whose frontmatter
     allowlists view_file only — no shell for untrusted content."""
     fake_agy("echoargs")
@@ -341,12 +342,12 @@ async def test_plain_chat_agent_is_readonly_by_default(client, fake_agy, tmp_pat
         "messages": [{"role": "user", "content": "summarize this web page: ..."}],
     })
     assert r.status_code == 200
-    agent_md = (tmp_path / "agent-plugin" / "agents" / "hermes.md").read_text()
+    agent_md = agent_writes[-1]
     assert "tools: [view_file]\n" in agent_md  # agy 1.4.8 list form
     assert "inheritMcp: false" in agent_md and "mcpServers" not in agent_md
 
 
-async def test_tool_turn_agent_keeps_full_tools(client, fake_agy, tmp_path):
+async def test_tool_turn_agent_keeps_full_tools(client, fake_agy, tmp_path, agent_writes):
     fake_agy("simple")
     http, _ = client
     r = await http.post("/v1/chat/completions", json={
@@ -357,7 +358,7 @@ async def test_tool_turn_agent_keeps_full_tools(client, fake_agy, tmp_path):
         "tools": [{"type": "function", "function": {"name": "get_weather"}}],
     })
     assert r.status_code == 200
-    agent_md = (tmp_path / "agent-plugin" / "agents" / "hermes.md").read_text()
+    agent_md = agent_writes[-1]
     # Full builtin set incl. call_mcp_tool = no `tools:` field on agy 1.4.8
     # (the old `tools: "*"` makes 1.4.8 skip the agent).
     assert "tools:" not in agent_md and "You are an agent." in agent_md
@@ -485,10 +486,10 @@ async def test_readonly_agent_failure_fails_closed(client, monkeypatch):
     assert response.json()["error"]["code"] == "agent_unavailable"
 
 
-async def test_readonly_survives_system_agent_disabled(client, fake_agy, monkeypatch, tmp_path):
+async def test_readonly_survives_system_agent_disabled(client, fake_agy, monkeypatch, tmp_path, agent_writes):
     fake_agy("simple")
     monkeypatch.setattr(get_settings(), "system_prompt_via_agent", False)
     http, _ = client
     response = await http.post("/v1/chat/completions", json={"messages": [{"role": "user", "content": "hi"}]})
     assert response.status_code == 200
-    assert 'tools: [view_file]' in (tmp_path / "agent-plugin/agents/hermes.md").read_text()
+    assert "tools: [view_file]" in agent_writes[-1]

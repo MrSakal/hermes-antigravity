@@ -46,11 +46,11 @@ import time
 
 from collections import deque
 from pathlib import Path
-from typing import Optional, Union
+from typing import Any, Optional, Union
 
 import anyio
 
-from app.events import ChatEvent, Error, parse_line
+from app.events import ChatEvent, Error, Init, parse_line
 from app.timing import log_spawn
 
 logger = logging.getLogger("agi.session")
@@ -94,7 +94,6 @@ class AgySession:
         model: Optional[str],
         workdir: Union[str, Path],
         prompt: Optional[str] = None,
-        conversation_id: Optional[str] = None,
         agent: Optional[str] = None,
         print_timeout_s: int = 0,
         disable_slash_commands: bool = True,
@@ -102,6 +101,7 @@ class AgySession:
         timing_label: str = "session",
         event_queue_size: int = 256,
         stdin_timeout_s: float = 30,
+        observer: Optional[Any] = None,
     ) -> None:
         if event_queue_size < 1 or stdin_timeout_s <= 0:
             raise ValueError("event_queue_size and stdin_timeout_s must be positive")
@@ -111,10 +111,8 @@ class AgySession:
         self.model = model
         self.workdir = str(workdir)
         self.prompt = prompt
-        # Set at construction for a ``--conversation`` resume; otherwise learned
-        # from the init / result lines (see ConversationManager.run_turn).
-        self.conversation_id = conversation_id
-        self.resumed = conversation_id is not None
+        # Learned from the init / result lines (see ConversationManager.run_turn).
+        self.conversation_id: Optional[str] = None
         self.agent = agent
         # 0 = disabled: a persistent process idles between turns and blocks
         # inside our MCP call_tool; the turn loop enforces its own deadline.
@@ -122,6 +120,11 @@ class AgySession:
         self.disable_slash_commands = disable_slash_commands
         self.timing_log = timing_log
         self.timing_label = timing_label
+        # app.housekeeping.Housekeeper (or None): per-process --log-file,
+        # ownership ledger, deletion of the agy state once the process is gone.
+        self.observer = observer
+        self.log_file: Optional[str] = None
+        self._saw_error = False
 
         self._proc: Optional[asyncio.subprocess.Process] = None
         self._queue: asyncio.Queue[Union[ChatEvent, object]] = asyncio.Queue(maxsize=event_queue_size)
@@ -137,7 +140,7 @@ class AgySession:
         self.spawned_at: Optional[float] = None
         self._available = asyncio.Event()
         # Set on the first stdout line (or EOF): agy has read its --agent file
-        # by then (see app.agent_config), so the spawn lock may be released.
+        # by then (see app.agent_config), so its transient file may be deleted.
         self._started = asyncio.Event()
         # True once a real stdout line arrived. EOF without one = agy died at
         # boot (logged out, bad --model, rejected agent frontmatter): see
@@ -146,16 +149,13 @@ class AgySession:
         self._writer_error: Optional[Error] = None
         self._close_task: Optional[asyncio.Task[None]] = None
         # Teardown mode read by _close_impl: graceful = close stdin and let agy
-        # exit on its own first (an IDLE process — it flushes its conversation
-        # DB for a later --conversation resume); otherwise straight to the kill.
+        # exit on its own first (an IDLE process); otherwise straight to the kill.
         self._graceful_close = False
         # Windows: the ``taskkill /T /F`` started by kill_now().
         self._killer: Optional[subprocess.Popen] = None
         self._pgid: Optional[int] = None
         self._pushback: deque[Union[ChatEvent, object]] = deque()
-        # Set once teardown finished and the process is gone: a
-        # ``--conversation`` resume of the same agy conversation must not start
-        # while this process may still write to it.
+        # Set once teardown finished and the process is gone.
         self.closed_event = asyncio.Event()
         # Diagnostics: last raw stdout lines the parser skipped + stderr tail.
         self.raw_tail: deque[str] = deque(maxlen=5)
@@ -181,10 +181,12 @@ class AgySession:
             args.append("--disable-slash-commands")
         if self.model:
             args += ["--model", self.model]
-        if self.conversation_id:
-            args += ["--conversation", self.conversation_id]
         if self.agent:
             args += ["--agent", self.agent]
+        if self.log_file:
+            # Our own per-process log instead of a new acli/log/cli-*.log
+            # (verified on 1.4.8); deleted when the process ends.
+            args += ["--log-file", self.log_file]
         return args
 
     # ── lifecycle ─────────────────────────────────────────────────────────—
@@ -198,10 +200,12 @@ class AgySession:
             raise RuntimeError("session is closed")
         if self._proc is not None:
             return
+        if self.observer is not None and self.log_file is None:
+            self.log_file = self.observer.log_file_for(self)
         args = self._build_args()
         logger.info(
-            "spawning agy: model=%s workdir=%s conv=%s agent=%s deferred=%s",
-            self.model, self.workdir, self.conversation_id, self.agent, self.prompt is None,
+            "spawning agy: model=%s workdir=%s agent=%s deferred=%s",
+            self.model, self.workdir, self.agent, self.prompt is None,
         )
         spawn_t0 = time.monotonic()
         try:
@@ -223,6 +227,8 @@ class AgySession:
             ) from e
         if os.name == "posix":
             self._pgid = self._proc.pid
+        if self.observer is not None:
+            self.observer.on_spawn(self, self._proc.pid, self.log_file)
         self.spawned_at = time.monotonic()
         log_spawn(self.timing_log, self.timing_label, (time.monotonic() - spawn_t0) * 1000)
         self._reader_task = asyncio.create_task(self._read_stdout(), name="agy-stdout")
@@ -256,7 +262,7 @@ class AgySession:
         """Wait until the process printed its first stdout line (or exited).
 
         Returns False on timeout. EOF also returns True (the process can no
-        longer read anything, so the agent-file lock may be released) — callers
+        longer read anything, so its agent file may be deleted) — callers
         must then check :attr:`boot_failed`, which tells a dead boot from a live
         one. Already-queued events count as started so test doubles that fill
         the queue without a real process pass through."""
@@ -354,6 +360,10 @@ class AgySession:
                 line = raw.decode("utf-8", "replace")
                 ev = parse_line(line)
                 if ev is not None:
+                    if isinstance(ev, Init) and ev.conversation_id:
+                        self._on_init(ev.conversation_id)
+                    elif isinstance(ev, Error):
+                        self._saw_error = True
                     if self._closed:
                         break
                     await self._queue.put(ev)
@@ -364,6 +374,16 @@ class AgySession:
             self._eof = True
             self._started.set()
             self._available.set()
+
+    def _on_init(self, conversation_id: str) -> None:
+        """Every ``init`` line: record the agy conversation id in the ownership
+        ledger. :attr:`conversation_id` itself is learned by the turn loop
+        (thinking passthrough tells a fresh process from a reused one by it)."""
+        if self.observer is not None:
+            try:
+                self.observer.on_init(self, conversation_id)
+            except Exception:  # pragma: no cover - defensive
+                logger.warning("housekeeping on_init failed", exc_info=True)
 
     async def _read_stderr(self) -> None:
         assert self._proc is not None and self._proc.stderr is not None
@@ -606,4 +626,9 @@ class AgySession:
                 self._pgid = None
                 await proc.wait()
         finally:
+            if self.observer is not None:
+                try:
+                    self.observer.on_exit(self, failed=bool(self.boot_failed or self._saw_error))
+                except Exception:  # pragma: no cover - defensive
+                    logger.warning("housekeeping on_exit failed", exc_info=True)
             self.closed_event.set()

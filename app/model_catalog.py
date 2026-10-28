@@ -17,7 +17,7 @@ import logging
 import re
 import time
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Optional
 
 logger = logging.getLogger("agi.models")
 
@@ -79,6 +79,10 @@ class ModelCatalog:
         self.last_attempt_at: Optional[float] = None
         self.last_success_at: Optional[float] = None
         self.last_error: Optional[str] = None
+        # app.housekeeping.Housekeeper (or None): each `agy models` run gets
+        # its own --log-file in our state dir, deleted right after.
+        self.housekeeper: Any = None
+        self._last_pid: Optional[int] = None
 
     # ── read side ────────────────────────────────────────────────────────────
 
@@ -125,52 +129,67 @@ class ModelCatalog:
         Never raises — a failure keeps the previous (or static) catalog."""
         async with self._lock:
             self.last_attempt_at = time.time()
-            proc: Optional[asyncio.subprocess.Process] = None
+            hk = self.housekeeper
+            log = hk.models_log_file() if hk is not None else None
+            started_at = time.time()
+            ok = False
             try:
-                proc = await asyncio.create_subprocess_exec(
-                    self.agy_bin, "models",
-                    stdin=asyncio.subprocess.DEVNULL,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                )
-                out, err = await asyncio.wait_for(proc.communicate(), timeout=self.query_timeout_s)
-            except FileNotFoundError:
-                self.last_error = "binary_not_found"
-                logger.warning("model catalog: agy binary %r not found", self.agy_bin)
-                return False
-            except asyncio.TimeoutError:
-                self.last_error = "timeout"
-                logger.warning("model catalog: `agy models` timed out after %.0fs", self.query_timeout_s)
-                if proc is not None:
-                    with contextlib.suppress(ProcessLookupError):
-                        proc.kill()
-                    await proc.wait()
-                return False
-            except asyncio.CancelledError:
-                if proc is not None:
-                    with contextlib.suppress(ProcessLookupError):
-                        proc.kill()
-                    await proc.wait()
-                raise
-            except OSError as e:
-                self.last_error = str(e)
-                logger.warning("model catalog: cannot run `agy models`: %s", e)
-                return False
-            entries = parse_models_output(out.decode("utf-8", "replace"))
-            if proc.returncode != 0 or not entries:
-                self.last_error = f"exit={proc.returncode}; entries={len(entries)}"
-                logger.warning(
-                    "model catalog: `agy models` rc=%s entries=%d stderr=%r",
-                    proc.returncode, len(entries), err.decode("utf-8", "replace")[:200],
-                )
-                return False
-            if [e.slug for e in entries] != [e.slug for e in self._entries]:
-                logger.info("model catalog: %d models: %s", len(entries), ", ".join(e.slug for e in entries))
-            self._entries = entries
-            self._loaded_at = time.monotonic()
-            self.last_success_at = time.time()
-            self.last_error = None
-            return True
+                ok = await self._query(log)
+            finally:
+                if hk is not None:
+                    hk.release_log(log, failed=not ok, pid=self._last_pid,
+                                   started_at=started_at)
+            return ok
+
+    async def _query(self, log: Optional[str]) -> bool:
+        proc: Optional[asyncio.subprocess.Process] = None
+        self._last_pid = None
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                self.agy_bin, *(["--log-file", log] if log else []), "models",
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            self._last_pid = proc.pid
+            out, err = await asyncio.wait_for(proc.communicate(), timeout=self.query_timeout_s)
+        except FileNotFoundError:
+            self.last_error = "binary_not_found"
+            logger.warning("model catalog: agy binary %r not found", self.agy_bin)
+            return False
+        except asyncio.TimeoutError:
+            self.last_error = "timeout"
+            logger.warning("model catalog: `agy models` timed out after %.0fs", self.query_timeout_s)
+            if proc is not None:
+                with contextlib.suppress(ProcessLookupError):
+                    proc.kill()
+                await proc.wait()
+            return False
+        except asyncio.CancelledError:
+            if proc is not None:
+                with contextlib.suppress(ProcessLookupError):
+                    proc.kill()
+                await proc.wait()
+            raise
+        except OSError as e:
+            self.last_error = str(e)
+            logger.warning("model catalog: cannot run `agy models`: %s", e)
+            return False
+        entries = parse_models_output(out.decode("utf-8", "replace"))
+        if proc.returncode != 0 or not entries:
+            self.last_error = f"exit={proc.returncode}; entries={len(entries)}"
+            logger.warning(
+                "model catalog: `agy models` rc=%s entries=%d stderr=%r",
+                proc.returncode, len(entries), err.decode("utf-8", "replace")[:200],
+            )
+            return False
+        if [e.slug for e in entries] != [e.slug for e in self._entries]:
+            logger.info("model catalog: %d models: %s", len(entries), ", ".join(e.slug for e in entries))
+        self._entries = entries
+        self._loaded_at = time.monotonic()
+        self.last_success_at = time.time()
+        self.last_error = None
+        return True
 
     async def refresh_loop(self) -> None:
         interval = max(60, self.refresh_interval_s)
