@@ -70,8 +70,10 @@ def test_api_v1_models_matches_v1_models():
     b = client.get("/v1/models")
     assert a.status_code == 200
     assert b.status_code == 200
-    strip = lambda body: {**body, "data": [{k: v for k, v in m.items() if k != "created"} for m in body["data"]]}
-    assert strip(a.json()) == strip(b.json())  # `created` is now(); a second boundary may fall between the two calls
+    strip = lambda data: [{k: v for k, v in m.items() if k != "created"} for m in data]
+    assert strip(a.json()["data"]) == strip(b.json()["data"])  # `created` is now(); may tick between calls
+    # LM Studio native shape alongside (hermes fingerprints this path as LM Studio).
+    assert [m["key"] for m in a.json()["models"]] == [m["id"] for m in b.json()["data"]]
 
 
 def test_healthz_carries_version():

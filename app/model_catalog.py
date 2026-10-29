@@ -17,7 +17,7 @@ import logging
 import re
 import time
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 logger = logging.getLogger("agi.models")
 
@@ -83,6 +83,9 @@ class ModelCatalog:
         # its own --log-file in our state dir, deleted right after.
         self.housekeeper: Any = None
         self._last_pid: Optional[int] = None
+        # Called with the fresh entries after each successful refresh (e.g.
+        # the model-limits provider). Failures there never affect the catalog.
+        self.on_refresh: Optional[Callable[[list[ModelEntry]], Awaitable[object]]] = None
 
     # ── read side ────────────────────────────────────────────────────────────
 
@@ -139,6 +142,11 @@ class ModelCatalog:
                 if hk is not None:
                     hk.release_log(log, failed=not ok, pid=self._last_pid,
                                    started_at=started_at)
+            if ok and self.on_refresh is not None:
+                try:
+                    await self.on_refresh(self.entries)
+                except Exception:  # never let a hook break the catalog
+                    logger.exception("model catalog: on_refresh hook failed")
             return ok
 
     async def _query(self, log: Optional[str]) -> bool:

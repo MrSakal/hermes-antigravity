@@ -103,7 +103,7 @@ async def _deadline_stream(iterator, timeout):
             async for chunk in iterator:
                 yield chunk
     except TimeoutError:
-        yield sse(error_envelope('request deadline exceeded', type='timeout_error'))
+        yield sse(error_envelope('request deadline exceeded', type='timeout_error', status_code=504))
         yield DONE
     finally:
         await iterator.aclose()
@@ -135,8 +135,11 @@ def check_prompt_size(prompt: str, settings: Settings) -> int:
         return _check_prompt_size(prompt, settings)
     except PromptTooLarge as e:
         raise OpenAIError(
-            f"prompt is {e.nbytes} UTF-8 bytes; the server cap is {e.cap} "
-            "(AGI_MAX_PROMPT_BYTES). Shorten the conversation.",
+            # Leading "context length exceeded" is load-bearing: OpenAI-style
+            # clients (hermes' error_classifier) match the message text, not
+            # the code, to decide to compress the history and retry.
+            f"context length exceeded: prompt is {e.nbytes} UTF-8 bytes; the server "
+            f"cap is {e.cap} (AGI_MAX_PROMPT_BYTES). Shorten the conversation.",
             status_code=400, type="invalid_request_error", code="context_length_exceeded",
         )
 
@@ -291,7 +294,7 @@ async def _stream(mgr: ConversationManager, conv: Conversation, cid: str, model:
                     yield sse(finish_chunk(cid, model, created, ch.finish_reason, ch.usage or None))
                     break
                 elif isinstance(ch, ErrorChunk):
-                    yield sse(error_envelope(ch.message, type=_error_type(ch.status_code)))
+                    yield sse(error_envelope(ch.message, type=_error_type(ch.status_code), status_code=ch.status_code))
                     break
         yield DONE
     finally:

@@ -26,9 +26,10 @@ from app.config import KNOWN_MODELS, get_settings
 from app.conversation import ConversationManager
 from app.errors import OpenAIError
 from app.mcp_bridge import McpBridge
-from app.housekeeping import Housekeeper
+from app.housekeeping import Housekeeper, resolve_agy_root
 from app.mcp_config import cleanup_legacy_mcp_entries, legacy_entries_remaining
 from app.model_catalog import ModelCatalog
+from app.model_limits import ModelLimitsProvider
 from app.resources import AttachmentStore, Metrics
 from app.request_guard import RequestGuard
 from app.routes import chat, compat, health, models
@@ -59,6 +60,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         logger.info("model catalog loaded from `agy models` (%d models)", len(catalog.entries))
     else:
         logger.warning("model catalog: using static fallback table (%d models)", len(KNOWN_MODELS))
+    limits: ModelLimitsProvider | None = app.state.model_limits
+    if limits is not None:
+        await limits.refresh(catalog.entries)
+        catalog.on_refresh = limits.refresh
     catalog_task = None
     attachment_task = asyncio.create_task(app.state.attachments.gc_loop(), name="agi-attachments")
     if settings.model_catalog_refresh_s > 0:
@@ -143,6 +148,12 @@ def create_app() -> FastAPI:
     housekeeper = Housekeeper(settings, plugin_path=agent_plugin.path,
                               agent_name=settings.agent_name)
     app.state.housekeeper = housekeeper
+    agy_root = resolve_agy_root(settings)  # agy's own OAuth token + project id live here
+    app.state.model_limits = ModelLimitsProvider(
+        endpoint=settings.model_limits_endpoint,
+        token_path=agy_root / "antigravity-oauth-token",
+        project_path=agy_root / "cache" / "default_project_id.txt",
+    ) if settings.model_limits_enabled else None
     housekeeper.on_workdirs = app.state.attachments.add_workdirs
     app.state.attachments.on_workdir = housekeeper.note_workdir
     manager = ConversationManager(mcp, settings, agents=agent_plugin, housekeeper=housekeeper)

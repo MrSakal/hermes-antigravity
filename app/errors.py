@@ -56,5 +56,11 @@ def error_envelope(
     type: str = "server_error",
     param: Optional[str] = None,
     code: Optional[str] = None,
+    status_code: Optional[int] = None,
 ) -> dict[str, Any]:
-    return {"error": {"message": message, "type": type, "param": param, "code": code}}
+    err: dict[str, Any] = {"message": message, "type": type, "param": param, "code": code}
+    # Mid-stream errors ride inside an HTTP-200 SSE body, so the real status is
+    # otherwise lost; clients (hermes, OpenRouter-style relays) read it here.
+    if status_code is not None:
+        err["status_code"] = status_code
+    return {"error": err}

@@ -12,6 +12,8 @@ remain valid inputs without being listed.
 
 from __future__ import annotations
 
+from typing import Optional
+
 from fastapi import APIRouter, Request
 
 from app.config import _FAMILY_VARIANTS, resolve_model, UnknownModel
@@ -51,6 +53,38 @@ def advertised_model_ids(request: Request) -> list[str]:
     return list(dict.fromkeys(families))
 
 
+def model_limits(model_id: str, request: Request) -> tuple[Optional[int], Optional[int]]:
+    """``(context_length, max_completion_tokens)`` for any accepted id.
+
+    A family id (``gemini-3.8-flash``) covers several agy variants; the
+    advertised limit is the smallest across them, so a client never assumes
+    more room than the effort it picks actually has. Unknown → ``(None, None)``.
+    """
+    provider = getattr(request.app.state, "model_limits", None)
+    catalog = getattr(request.app.state, "model_catalog", None)
+    if provider is None or catalog is None or not catalog.loaded:
+        return None, None
+    entries = catalog.entries
+    slugs = [e.slug for e in entries if model_id in (e.slug, e.family, e.display)]
+    if not slugs:  # short aliases ("flash", "argon"): resolve like a request would
+        settings = request.app.state.settings.model_copy(update={"strict_model": True})
+        try:
+            display = resolve_model(model_id, settings, known_models=catalog.display_names(),
+                                    families=catalog.families())
+        except UnknownModel:
+            return None, None
+        slugs = [e.slug for e in entries if e.display == display]
+    found = [lim for s in slugs if (lim := provider.get(s)) is not None]
+    ctx = [l.context_length for l in found if l.context_length]
+    out = [l.max_output_tokens for l in found if l.max_output_tokens]
+    return (min(ctx) if ctx else None, min(out) if out else None)
+
+
+def model_card(model_id: str, request: Request) -> ModelCard:
+    ctx, out = model_limits(model_id, request)
+    return ModelCard(id=model_id, context_length=ctx, max_completion_tokens=out)
+
+
 def known_model(model_id: str, request: Request) -> bool:
     """Use completion alias resolution, but always reject unknown probe IDs."""
     if not model_id or not model_id.strip():
@@ -69,16 +103,16 @@ def known_model(model_id: str, request: Request) -> bool:
     return True
 
 
-@router.get("/v1/models", response_model=ModelList)
+@router.get("/v1/models", response_model=ModelList, response_model_exclude_none=True)
 async def list_models(request: Request) -> ModelList:
-    return ModelList(data=[ModelCard(id=mid) for mid in advertised_model_ids(request)])
+    return ModelList(data=[model_card(mid, request) for mid in advertised_model_ids(request)])
 
 
-@router.get("/v1/models/{model_id}", response_model=ModelCard)
+@router.get("/v1/models/{model_id}", response_model=ModelCard, response_model_exclude_none=True)
 async def get_model(model_id: str, request: Request) -> ModelCard:
     if not known_model(model_id, request):
         raise OpenAIError(
             f"model {model_id!r} not found", status_code=404,
             type="invalid_request_error", param="model", code="model_not_found",
         )
-    return ModelCard(id=model_id)
+    return model_card(model_id, request)

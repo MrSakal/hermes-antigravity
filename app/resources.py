@@ -93,7 +93,7 @@ def validate_request(req, settings) -> dict[str, bytes]:
                 raise OpenAIError('invalid image base64', param='messages') from exc
             total += len(raw)
             if len(raw) > settings.max_image_bytes or total > settings.max_total_image_bytes:
-                raise OpenAIError('images exceed decoded byte limit', param='messages', code='context_length_exceeded')
+                raise OpenAIError('image exceeds decoded byte limit (all images combined)', param='messages', code='context_length_exceeded')
             images['img-'+hashlib.sha1(raw).hexdigest()[:16]+ext] = raw
     return images
 

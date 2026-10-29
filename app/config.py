@@ -129,6 +129,13 @@ class Settings(BaseSettings):
     # superset (variant slugs + families + display names). Every id stays a
     # valid request input either way.
     advertise_models: Literal["families", "all"] = "families"
+    # Real per-model limits (maxTokens / maxOutputTokens) from the same Cloud
+    # Code RPC agy uses: fetched at startup, re-fetched only when the
+    # `agy models` slug set changes (or after a failed fetch), and advertised on
+    # /v1/models as context_length / max_completion_tokens. No static table:
+    # when the RPC fails or a model is unknown there, the fields are omitted.
+    model_limits_enabled: bool = True
+    model_limits_endpoint: str = "https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels"
     # Unknown `model` ids: True → 400 model_not_found (OpenAI semantics, the
     # client sees its mistake); False → silently use default_model (legacy).
     strict_model: bool = True

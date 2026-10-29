@@ -400,8 +400,11 @@ class ConversationManager:
             check_prompt_size(content, self.settings)
         except PromptTooLarge as e:
             raise OpenAIError(
-                f"prompt is {e.nbytes} UTF-8 bytes; the server cap is {e.cap} "
-                "(AGI_MAX_PROMPT_BYTES). Shorten the conversation.",
+            # Leading "context length exceeded" is load-bearing: OpenAI-style
+                # clients (hermes' error_classifier) match the message text, not
+                # the code, to decide to compress the history and retry.
+                f"context length exceeded: prompt is {e.nbytes} UTF-8 bytes; the server "
+                f"cap is {e.cap} (AGI_MAX_PROMPT_BYTES). Shorten the conversation.",
                 status_code=400, type="invalid_request_error", code="context_length_exceeded",
             ) from e
 
@@ -808,7 +811,7 @@ class ConversationManager:
                 # Init / others: ignore.
         except TimeoutError:
             await self._close(conv)
-            yield ErrorChunk("upstream timeout", status_code=504)
+            yield ErrorChunk("upstream timed out", status_code=504)
         except BaseException:
             # Abandoned mid-turn (client disconnect / cancellation) or failed on
             # a bug: agy has no per-turn cancel and this process' history now

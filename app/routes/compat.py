@@ -15,8 +15,7 @@ from importlib.metadata import PackageNotFoundError, version as _pkg_version
 from fastapi import APIRouter, Request, Response, status
 from pydantic import BaseModel
 
-from app.openai_models import ModelList
-from app.routes.models import advertised_model_ids, list_models, known_model
+from app.routes.models import advertised_model_ids, known_model, model_card, model_limits
 
 router = APIRouter()
 
@@ -84,17 +83,23 @@ async def api_show(body: ShowRequest, request: Request, response: Response) -> d
     if not requested or not known_model(requested, request):
         response.status_code = status.HTTP_404_NOT_FOUND
         return {"error": f"model {requested!r} not found"}
+    ctx, _out = model_limits(requested, request)
+    model_info: dict = {
+        "general.architecture": "antigravity",
+        "general.basename": requested,
+    }
+    if ctx:
+        model_info["antigravity.context_length"] = ctx
     return {
         "license": "",
         "modelfile": "",
         "parameters": "",
         "template": "",
         "details": dict(_DETAILS),
-        "model_info": {
-            "general.architecture": "antigravity",
-            "general.basename": requested,
-        },
-        "capabilities": ["completion"],
+        "model_info": model_info,
+        # What the server actually supports for every model: OpenAI tool
+        # calling (MCP bridge), reasoning passthrough, data-URL image input.
+        "capabilities": ["completion", "tools", "thinking", "vision"],
     }
 
 
@@ -141,6 +146,23 @@ async def props(request: Request) -> dict:
 # ── Ollama-style alias for the OpenAI model list ─────────────────────────────
 
 
-@router.get("/api/v1/models", response_model=ModelList)
-async def api_v1_models(request: Request) -> ModelList:
-    return await list_models(request)
+@router.get("/api/v1/models")
+async def api_v1_models(request: Request) -> dict:
+    """OpenAI ``data`` list plus LM Studio's native ``models`` list.
+
+    LM Studio serves this path natively, so clients that fingerprint servers
+    (hermes' ``detect_local_server_type``) treat any 200 here as LM Studio and
+    read limits from ``models[].loaded_instances[].config.context_length`` /
+    ``models[].max_completion_tokens``. Both shapes carry the same ids."""
+    cards = [model_card(mid, request) for mid in advertised_model_ids(request)]
+    lmstudio = []
+    for c in cards:
+        m: dict = {"type": "llm", "key": c.id, "id": c.id, "display_name": c.id,
+                   "publisher": "google", "loaded_instances": []}
+        if c.context_length:
+            m["max_context_length"] = c.context_length
+            m["loaded_instances"] = [{"id": c.id, "config": {"context_length": c.context_length}}]
+        if c.max_completion_tokens:
+            m["max_completion_tokens"] = c.max_completion_tokens
+        lmstudio.append(m)
+    return {"object": "list", "data": [c.model_dump(exclude_none=True) for c in cards], "models": lmstudio}

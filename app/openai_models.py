@@ -153,6 +153,10 @@ class ModelCard(BaseModel):
     object: Literal["model"] = "model"
     created: int = Field(default_factory=_now)
     owned_by: str = "google"
+    # Backend-reported limits; omitted (not guessed) when unknown. Read by
+    # OpenAI-style clients (hermes model_metadata) instead of a name heuristic.
+    context_length: Optional[int] = None
+    max_completion_tokens: Optional[int] = None
 
 
 class ModelList(BaseModel):
